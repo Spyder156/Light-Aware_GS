@@ -1,0 +1,13 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# generated synthetic captures (regenerable via step1)
+data/
+*.pt
+
+# os / editor
+.DS_Store
+*.swp
