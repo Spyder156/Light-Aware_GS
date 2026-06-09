@@ -8,6 +8,9 @@ __pycache__/
 data/
 *.pt
 
+# cloned upstream repos we READ for reference (not part of our tree; pip-installed separately)
+reference/
+
 # os / editor
 .DS_Store
 *.swp
