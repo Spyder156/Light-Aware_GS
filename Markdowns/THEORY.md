@@ -96,6 +96,29 @@ $$
 
 ---
 
+## 3.5 Inter-reflection breaks the metamer (the physical witness)
+
+The rescale invariance of §3 is **exact only for directly-lit (single-bounce) surfaces.** It is *not* a symmetry of light that bounces more than once. Write the image as a sum over light-transport paths; a path that reflects off **k** diffuse surfaces before reaching the eye contributes (per channel):
+
+$$I_k \;=\; (\text{geometry / form factors})\cdot L \cdot \prod_{i=1}^{k}\rho^{(i)}.$$
+
+Apply the gauge $\;\boldsymbol{\rho}\to\boldsymbol{\rho}\oslash\mathbf{g},\; L\to L\odot\mathbf{g}\;$:
+
+$$I_k \;\longrightarrow\; (L\,\mathbf{g})\cdot\prod_{i=1}^{k}\frac{\rho^{(i)}}{\mathbf{g}} \;=\; I_k\cdot \mathbf{g}^{\,1-k}.$$
+
+- **k = 1 (direct):** $\mathbf{g}^{0}=1$ → invariant. *This is the degenerate direction of §3.*
+- **k ≥ 2 (inter-reflection):** scales by $\mathbf{g}^{1-k}\neq 1$ → **not** invariant.
+
+So the total image $I=\sum_k I_k$ is gauge-invariant **iff only the direct term exists**. Indirect light is therefore a **witness** to the true factorization. Physically: red light in a white room stays red at every bounce ($L\odot\rho^k$ with neutral $\rho$); white light in a pink room gets *more saturated* with each bounce ($\rho^k$). The **hue-vs-bounce-depth gradient** is a fingerprint the single global $\mathbf{g}$ cannot fake, because it cannot apply the right power of itself to every bounce depth at once.
+
+**Consequence (validated in Step 5, exact differentiable radiosity in a Cornell corner):** with multi-bounce light present, the **data term alone — no prior — recovers the correct factorization**, and does so independently of initialization (well-posed). With only direct light the same inverse is underdetermined and init-dependent. This is a property of the **data**, not the model: single-bounce observations are information-theoretically gauge-invariant, so a direct-only baseline is *not crippled* — the information is simply absent.
+
+**Honest magnitude — a real cue, not a loud one.** Indirect energy is small (each bounce loses $\rho\cdot\text{form factor}\ll 1$), and the divergence lives in dim regions (corners, crevices, color-bleed seams). Step 5 measures it: under realistic sensor noise the clean recovery gap ($\sim$400× lower albedo error with GI) shrinks to $\sim$2.6×, and the bounce-depth saturation slope stays separable (true $\approx$ flat, wrong $\approx +0.2$). So GI disambiguates strongly in **colored, concave, cluttered** scenes and weakly for **isolated convex** objects — which is why the §4 priors and a reference anchor remain valuable as belt-and-suspenders.
+
+**Architectural payoff.** A rasterizer does direct shading only and is **blind** to this. A ray-traced Gaussian representation (the 3DGRT plan, concept §7) traces multi-bounce transport and can see it. So ray tracing is justified not merely by relighting shadows but as the **physical mechanism that makes the decomposition well-posed.** Two related, cheaper cues point the same way: a **dielectric specular highlight** reflects the light's color un-tinted by surface albedo (a free white-card wherever there is gloss), and **color cross-bleed** between differently-colored objects over-determines $\mathbf{g}$. (Prior art: color constancy from mutual illumination — Funt–Drew–Ho 1991; interreflection analysis — Nayar–Ikeuchi–Kanade. Our framing, not the physics, is the contribution.)
+
+---
+
 ## 4. Disambiguation as regularizers (turning *self-consistent* → *correct*)
 
 Each prior $\mathcal{R}_q$ removes part of the $\mathbf{g}$ freedom. These are *our own* design (we deliberately do **not** import other papers' mechanisms):
