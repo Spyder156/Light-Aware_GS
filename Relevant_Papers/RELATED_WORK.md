@@ -25,3 +25,43 @@ Running index of relevant papers. Each entry: what it is → what (if anything) 
 - *Occupancy–opacity factorization, specular shading network, gradient gating, reflection/transmission split* — all solve their fixed-lighting / semi-transparent problem. None addresses illumination inference or relighting. Importing any of them adds nothing to our contribution and makes us look derivative. Ignore.
 
 **Net:** a one-citation methodological ally that sits on the §9 "Table 1 turf" (consistent capture lighting). It does not encroach on our wedge (material/light decomposition + variable in-the-wild lighting + relighting). Cite it; keep our design as-is.
+
+---
+
+## Path-Traced Inverse Rendering with Global Illumination in 3D Gaussian Fields
+*Zhu, Zhang, Zhu, Li, Hu, Gai, Zhu, Huang, Li — USTC + Peking. arXiv:2606.09606, Jun 2026 (concurrent).* [PDF](MrNeRF.pdf) (filed as MrNeRF.pdf)
+
+**What it is.** Splatting-FREE path-traced inverse rendering on 3DGS: forward render + backward
+gradients both in one ray-tracing pipeline (no screen-space G-buffers). Recovers albedo/roughness/
+metallic + a learnable **Spherical-Gaussian environment light** under **multi-bounce GI** (full
+rendering equation, Path Replay Backprop, path-space equivalent surface interaction for overlapping
+Gaussians, MIS). New SOTA vs IRGS/SVG-IR/R3DG/GS-IR on TensoIR, Synthetic4Relight, RT4Relight.
+
+**The relationship in one line.** They do **static-environment** path-traced inverse rendering with
+GI; we infer & remove **unknown, frame-varying** capture lighting. They assume the one thing we refuse.
+
+**Where it overlaps (acknowledge precisely — do NOT over-concede):**
+1. **"GI aids decomposition" is theirs now — but our Step-5 claim is FINER and they did not make it.**
+   Their Fig. 10 (Cornell box) shows GI helps disentangle albedo from **color bleeding** (one
+   surface's color contaminating a neighbour's albedo). Our Step-5 claim is sharper: multi-bounce
+   breaks the **global albedo↔light-color gauge (the metamer)**, demonstrated by **no-prior
+   init-collapse** + the **bounce-depth saturation fingerprint**. They still rescale and rely on a
+   diffusion prior — i.e. they do NOT claim well-posedness. So: demote Step-5 to a SUPPORTING result
+   we cite alongside; do not bury it as scooped. "Multi-bounce makes the light-color decomposition
+   well-posed (init-collapse without a prior)" remains a distinct point.
+2. **It's a strong build of our planned Phase-4 infra** (ray-traced IR on Gaussians + GI + env-light +
+   relighting). The decomposition/GI/ray-tracing ENGINE is now crowded SOTA (this + RT-Splatting).
+   Don't compete on the machinery — build on it / cite it.
+
+**Repurpose the GI thread (don't drop it).** It stops being a headline and becomes the **bridge from
+their backbone to our wedge**: GI disambiguation only bites in **bounce-rich capture** — exactly the
+in-the-wild handheld regime they don't address. That's the justification for the light menu.
+
+**Where it does NOT touch us (the moat):** static single environment light only. Nothing on
+variable/unknown lighting DURING capture, the constrained light menu (ambient/static/**co-moving
+torch**), per-frame light inference, or in-the-wild handheld capture + dataset.
+
+**Net / strategic:** moat narrowed to the variable-capture-lighting front-end — now the WHOLE
+contribution. Cite this (+RT-Splatting) as the path-traced-IR-GS backbone. The single-fixed-light
+ceiling we hit in phase1_decompose (~24 dB relight) is the absence of variable lighting, not a tuning
+bug — our own experiment and the literature point the same way.
