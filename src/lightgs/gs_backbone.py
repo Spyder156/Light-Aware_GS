@@ -79,6 +79,7 @@ def render_gbuffers(g: MaterialGaussians, viewmat, K, W, H):
     colors, alphas, _ = gsplat.rasterization(
         g.means, g.quats, g.scales, g.opacities, feats,
         viewmat[None], K[None], W, H, render_mode="RGB+ED", packed=False,
+        rasterize_mode="antialiased",
     )
     out = colors[0]                                            # (H,W,11)
     alpha = alphas[0]                                          # (H,W,1)
@@ -92,9 +93,11 @@ def render_gbuffers(g: MaterialGaussians, viewmat, K, W, H):
             "alpha": alpha, "mask": (alpha[..., 0] > 0.5), "depth": depth}
 
 
-def deferred_shade(buf, lights, exposure=1.0):
+def deferred_shade(buf, lights, exposure=1.0, clamp=True):
     """Diffuse light-menu shading on G-buffers (THEORY.md 1.3), ported from Phase 0.
-    lights: list of (kind, color, pos) with kind in {'ambient','point'}. Returns (H,W,3)."""
+    lights: list of (kind, color, pos) with kind in {'ambient','point'}. Returns (H,W,3).
+    clamp=False returns linear HDR radiance (inverse rendering should fit in HDR, not clipped LDR --
+    clipped highlights carry no gradient and leave albedo underdetermined)."""
     alb, n, pos = buf["albedo"], buf["normal"], buf["position"]
     radiance = torch.zeros_like(alb)
     for kind, color, lpos in lights:
@@ -107,4 +110,7 @@ def deferred_shade(buf, lights, exposure=1.0):
             d2 = (l * l).sum(-1, keepdim=True)
             ndotl = (n * (l / (torch.sqrt(d2) + EPS))).sum(-1, keepdim=True).clamp(min=0)
             radiance = radiance + alb * color * (1.0 / (d2 + EPS)) * ndotl
-    return (radiance * exposure).clamp(0, 1) * buf["mask"][..., None].float()
+    out = radiance * exposure
+    if clamp:
+        out = out.clamp(0, 1)
+    return out * buf["mask"][..., None].float()
