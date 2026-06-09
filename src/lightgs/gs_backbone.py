@@ -74,17 +74,37 @@ def build_camera(az, elev, dist, W, H, fov_deg=45.0, target=(0, 0, 0)):
 def render_gbuffers(g: MaterialGaussians, viewmat, K, W, H):
     """One gsplat pass rasterizing packed material+normal features -> deferred G-buffers.
     Returns dict of (H,W,*): albedo, normal (renormalized), roughness, alpha(mask), depth."""
-    feats = torch.cat([g.albedo, g.normals, g.roughness], dim=-1)   # (N, 7)
+    # pack material + normal + world-position so shading needs no depth-unprojection
+    feats = torch.cat([g.albedo, g.normals, g.roughness, g.means], dim=-1)   # (N, 10)
     colors, alphas, _ = gsplat.rasterization(
         g.means, g.quats, g.scales, g.opacities, feats,
         viewmat[None], K[None], W, H, render_mode="RGB+ED", packed=False,
     )
-    out = colors[0]                                            # (H,W,8)
+    out = colors[0]                                            # (H,W,11)
     alpha = alphas[0]                                          # (H,W,1)
     a = alpha.clamp(min=EPS)
     albedo = (out[..., 0:3] / a).clamp(0, 1)                   # un-premultiply
     normal = torch.nn.functional.normalize(out[..., 3:6], dim=-1)
     rough = (out[..., 6:7] / a).clamp(0, 1)
-    depth = out[..., 7:8]
-    return {"albedo": albedo, "normal": normal, "roughness": rough,
+    position = out[..., 7:10] / a                              # composited surface point (world)
+    depth = out[..., 10:11]
+    return {"albedo": albedo, "normal": normal, "roughness": rough, "position": position,
             "alpha": alpha, "mask": (alpha[..., 0] > 0.5), "depth": depth}
+
+
+def deferred_shade(buf, lights, exposure=1.0):
+    """Diffuse light-menu shading on G-buffers (THEORY.md 1.3), ported from Phase 0.
+    lights: list of (kind, color, pos) with kind in {'ambient','point'}. Returns (H,W,3)."""
+    alb, n, pos = buf["albedo"], buf["normal"], buf["position"]
+    radiance = torch.zeros_like(alb)
+    for kind, color, lpos in lights:
+        color = torch.as_tensor(color, dtype=torch.float32, device=alb.device)
+        if kind == "ambient":
+            radiance = radiance + alb * color
+        else:
+            lpos = torch.as_tensor(lpos, dtype=torch.float32, device=alb.device)
+            l = lpos - pos
+            d2 = (l * l).sum(-1, keepdim=True)
+            ndotl = (n * (l / (torch.sqrt(d2) + EPS))).sum(-1, keepdim=True).clamp(min=0)
+            radiance = radiance + alb * color * (1.0 / (d2 + EPS)) * ndotl
+    return (radiance * exposure).clamp(0, 1) * buf["mask"][..., None].float()
