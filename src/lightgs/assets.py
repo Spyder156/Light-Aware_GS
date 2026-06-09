@@ -43,8 +43,9 @@ def make_albedo_texture(Ht=128, Wt=256):
         w, c = blob(cu, cv, rad, color)
         tex = tex * (1 - w) + c
 
-    # known-WHITE anchor patch (the reference card, THEORY.md 4.2)
-    d = (uu - 0.50) ** 2 + (vv - 0.72) ** 2
+    # known-WHITE anchor patch (the reference card, THEORY.md 4.2). Placed at a well-lit
+    # texel (faces the upper-left key light) so it actually works as a light probe.
+    d = (uu - 0.42) ** 2 + (vv - 0.30) ** 2
     anchor = (d < 0.0022)
     tex = torch.where(anchor[..., None], torch.full_like(tex, 0.9), tex)
 
