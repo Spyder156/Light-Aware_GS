@@ -39,6 +39,18 @@ material {albedo, kₛ, roughness} learned via per-Gaussian diffuse+GGX shading 
 rendering 40.5 dB**, plus **novel-viewpoint renders under held-out lights** — single consistent
 relightable object; the capability per-view PS cannot provide.
 
+### Capabilities built on DiLiGenT-MV (bear; the project's representation)
+- **De-lit material splat** (albedo/kₛ/roughness on Gaussians) ✓
+- **Relight**: any light, any viewpoint, simultaneously — held-out 40.5 dB ✓
+- **Cast shadows**: point shadow-maps in the forward model (+0.5 dB; frontal lights → small casts;
+  matters for oblique/near-field) ✓
+- **Light DETECTION**: lights inferred, calibration withheld → ~4.4–6° direction error; staged
+  ALS + frozen-light material training reaches **41.0 dB relight = parity with calibrated lights**.
+  Lesson (v2): free JOINT light+material refinement drifts along the metamer gauge and degrades the
+  closed-form solution — stage and freeze instead. Global intensity↔albedo gain is the irreducible
+  gauge (one scalar). ✓
+- Material-based segmentation: demoed, parked.
+
 ## Named limitations / next
 - No cast-shadow prediction at relight (visibility term — ray-traced phase)
 - White specular lobe (no colored/metallic F0 yet); buddha's dark gloss hardest
