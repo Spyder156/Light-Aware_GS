@@ -58,12 +58,30 @@ def main():
     albedo = torch.nan_to_num(torch.nanmedian(ratios, dim=1).values)       # (P,3)
     del ratios
 
-    # ---- GGX residual fit: per-pixel ks, roughness ----
+    # ---- GGX residual fit: per-pixel ks, roughness + EDGE-AWARE smoothness ----
+    # (free per-pixel BRDF overfits on 'reading': train +2 dB but novel -2 dB. Material maps should
+    #  be smooth except at material edges -> edge-aware TV weighted by albedo gradients.)
     ks_raw = torch.full((P, 1), -3.0, device=DEV, requires_grad=True)
     ro_raw = torch.full((P, 1), -1.0, device=DEV, requires_grad=True)
     opt = torch.optim.Adam([ks_raw, ro_raw], lr=0.05)
     Ltr = torch.tensor([L - 1 for L in TRAIN], device=DEV)
     Otr = torch.stack([obs[L] for L in TRAIN], 1)                          # (P,T,3)
+
+    # neighbor pairs on the pixel grid (right + down), edge weights from albedo
+    pos = torch.full((mask.shape[0], mask.shape[1]), -1, dtype=torch.long, device=DEV)
+    pos[ys, xs] = torch.arange(P, device=DEV)
+    ys_t = torch.tensor(ys, device=DEV); xs_t = torch.tensor(xs, device=DEV)
+    pairs = []
+    for dy, dx in [(0, 1), (1, 0)]:
+        ny, nx = ys_t + dy, xs_t + dx
+        ok = (ny < mask.shape[0]) & (nx < mask.shape[1])
+        nb = pos[ny.clamp(max=mask.shape[0] - 1), nx.clamp(max=mask.shape[1] - 1)]
+        ok = ok & (nb >= 0)
+        pairs.append((torch.arange(P, device=DEV)[ok], nb[ok]))
+    REG = 0.01
+    with torch.no_grad():
+        ew = [torch.exp(-(albedo[a] - albedo[b]).abs().sum(-1, keepdim=True) / 0.1)
+              for a, b in pairs]                                          # smooth where albedo smooth
 
     def spec_for(idx):
         l = Ld[idx][None]                                                  # (1,T,3)
@@ -82,9 +100,13 @@ def main():
         return (ks * D * G * F / (4 * ndv + EPS)) * (ndl > 0).float()      # (P,T) white lobe
 
     diff_tr = albedo[:, None, :] * ndls[:, Ltr][..., None]
-    for it in range(400):
+    for it in range(1000):
         pred = diff_tr + spec_for(Ltr)[..., None]
         loss = (pred - Otr).abs().mean()
+        reg_w = 0.0 if it < 300 else REG                                   # warm start: fit free, then smooth
+        if reg_w > 0:
+            for (a, b), w in zip(pairs, ew):                               # edge-aware TV on material maps
+                loss = loss + reg_w * (w * ((ks_raw[a] - ks_raw[b]).abs() + (ro_raw[a] - ro_raw[b]).abs())).mean()
         opt.zero_grad(); loss.backward(); opt.step()
     with torch.no_grad():
         ks = torch.nn.functional.softplus(ks_raw); rough = torch.sigmoid(ro_raw) * 0.9 + 0.05
