@@ -14,3 +14,7 @@ reference/
 # os / editor
 .DS_Store
 *.swp
+
+# cloned reference repos (read-only)
+MVPSNet/
+GaussianObject/
