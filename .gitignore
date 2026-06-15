@@ -21,3 +21,8 @@ GaussianObject/
 
 # large regenerable gaussian exports
 *.ply
+
+# JIT / build artifacts
+__pycache__/
+*.o
+*.so
