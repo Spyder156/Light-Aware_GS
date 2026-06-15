@@ -3,14 +3,14 @@
 Box: x,y,z in [-1,1], open front at z=+1. Left wall RED, right GREEN, others WHITE; white sphere.
 """
 import sys, math, os
-sys.path.insert(0, "/home/raghav/workspace/FullCircle/fullcircle")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "thirdparty"))
 import torch, numpy as np, imageio
 from omegaconf import OmegaConf
 from threedgrt_tracer.tracer import Tracer
 from threedgrut.datasets.protocols import Batch
 
 DEV = "cuda"; SH_C0 = 0.28209479177387814
-OUT = "/home/raghav/workspace/CVPR/Light-Aware_GS/outputs/rt"
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "outputs", "rt")
 
 
 class GS:

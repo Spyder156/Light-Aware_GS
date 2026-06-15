@@ -1,5 +1,5 @@
 import sys, math, os
-sys.path.insert(0, "/home/raghav/workspace/FullCircle/fullcircle"); sys.path.insert(0, "/home/raghav/workspace/CVPR/Light-Aware_GS/src/rt")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "thirdparty")); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch, numpy as np
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 from rt_gi import build_scene, surface, trace, tracer, DEV, OUT
