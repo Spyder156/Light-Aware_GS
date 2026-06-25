@@ -26,7 +26,7 @@ H = int(sys.argv[2]) if len(sys.argv)>2 else 128
 ITERS = int(sys.argv[3]) if len(sys.argv)>3 else 400
 GT_SPP = int(sys.argv[4]) if len(sys.argv)>4 else 256
 W=H; EPS=0.04; DMIN=0.6; GT_NB=3
-VOX=0.18; R_MAX=3.0; KNN=96; BOUNCES=2          # element clustering, form-factor neighborhood, indirect bounces
+VOX=0.18; R_MAX=3.0; KNN=96; BOUNCES=3          # element clustering, form-factor neighborhood, indirect bounces
 
 LIGHT_POS = torch.tensor([0.0,0.9,-0.1], device=DEV)
 LIGHT_INT_TRUE = torch.tensor([7.0,7.0,7.0], device=DEV)
@@ -170,13 +170,29 @@ def pixel_weights(p, n, cen, nor, k=8, chunk=16000):
     return nbr,w
 
 
+def exact_vis_G(tr, gsA0, p, n, cen, nor, area, pchunk=2000):
+    """EXACT per-pixel visibility: trace a ray from each pixel to each emitter patch, gate the gather by it.
+    Geometry-only -> precomputed once. Removes the coarse patch-level visibility approximation."""
+    HW=p.shape[0]*p.shape[1]; E=cen.shape[0]; pf=p.reshape(-1,3); nf=n.reshape(-1,3)
+    G=view_G(p,n,cen,nor,area); vis=torch.empty(HW,E,device=DEV)
+    for s in range(0,HW,pchunk):
+        ps=pf[s:s+pchunk]; ns=nf[s:s+pchunk]; c=ps.shape[0]
+        d=cen[None,:,:]-ps[:,None,:]; r=d.norm(dim=-1); u=d/(r[...,None]+1e-9)        # (c,E,3)
+        ori=(ps[:,None,:]+ns[:,None,:]*EPS).expand(-1,E,-1).reshape(-1,3)
+        op,dist=trace_flat(tr,gsA0,ori,u.reshape(-1,3))
+        vis[s:s+pchunk]=(~((op>0.5)&(dist<r.reshape(-1)-3*EPS))).float().view(c,E)
+    clo=(1.0/G.sum(1,keepdim=True).clamp(min=0.3)).clamp(max=1.6)                     # closure normalization
+    return G*vis*clo
+
+
 def gated_G(G, Vis, nbr, w, chunk=2048):
     """bake SOFT per-pixel visibility into G: each pixel blends its k-nearest patches' visibility rows,
     so the shadow boundary is smooth (no patch-step squares). Geometry-only -> precomputed once per view."""
     HW=G.shape[0]; out=torch.empty_like(G)
+    clo=(1.0/G.sum(1,keepdim=True).clamp(min=0.3)).clamp(max=1.6)                     # closure norm: fix ~18% discretization energy loss (capped for open front)
     for s in range(0,HW,chunk):
         vs=(w[s:s+chunk][:,:,None]*Vis[nbr[s:s+chunk]]).sum(1)                       # (c,E) soft visibility
-        out[s:s+chunk]=G[s:s+chunk]*vs
+        out[s:s+chunk]=G[s:s+chunk]*vs*clo[s:s+chunk]
     return out
 
 
@@ -241,7 +257,7 @@ def precompute(tr,S,gsA0,gsN):
         fac_pix=torch.relu((n0*lp_).sum(-1,keepdim=True))*vis0/(ldp.clamp(min=DMIN)**2)
         GTgi=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,GT_SPP,GT_NB).detach()
         GTdir=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,0,0).detach()
-        Graw=view_G(p0,n0,cen,nor,area); pnbr,pw=pixel_weights(p0,n0,cen,nor); G=gated_G(Graw,Vis,pnbr,pw)
+        G=exact_vis_G(tr,gsA0,p0,n0,cen,nor,area)                                    # exact per-pixel visibility (consistent with compare)
         views.append(dict(cam=cam,pdir=pdir,hit=hit0,p=p0,n=n0,alb_t=alb_t,fac=fac_pix,GTgi=GTgi,GTdir=GTdir,G=G))
     return dict(fac_g=fac_g,eid=eid,E=E,K=K,V=Vis,Kdens=dens,mean_fac_elem=mean_fac_elem,views=views,
                 cen=cen,nor=nor,area=area)
@@ -467,7 +483,7 @@ def stage_compare():
     smean=lambda x:(torch.zeros(E,x.shape[1],device=DEV).index_add_(0,eid,x))/cntN[:,None]
     rho_elem=smean(S["alb"]); Edir_elem=LIGHT_INT_TRUE.view(1,3)*mean_fac_elem[:,None]
     cam,pdir=camera(*VIEWS[0]); hit0,p0,n0,alb_t=surf(tr,gsA0,gsN,cam,pdir); n0=orient(n0,-pdir); m=(hit0>0)
-    Graw=view_G(p0,n0,cen,nor,area); pnbr,pw=pixel_weights(p0,n0,cen,nor); G=gated_G(Graw,Vis,pnbr,pw)
+    G=exact_vis_G(tr,gsA0,p0,n0,cen,nor,area)                                         # exact per-pixel visibility
     print(f"  E={E}; rendering high-q GT ...")
     B=radiosity(rho_elem,Edir_elem,K,BOUNCES); ind=alb_t/PI*(G@B).view(H,W,3)
     lvp=LIGHT_POS.view(1,1,3)-p0; ldp=lvp.norm(dim=-1,keepdim=True); lpp=lvp/(ldp+1e-9); vis0=shadow_vis(tr,gsA0,p0,n0,LIGHT_POS)
