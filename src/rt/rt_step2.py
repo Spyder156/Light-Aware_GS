@@ -1,570 +1,177 @@
-"""STEP 2 (per prof's plan): add ONE precomputed diffuse bounce via a form-factor operator, and test the
-A/B -- does indirect kill the drift Step 1 showed? Geometry is static & known => the transport operator F
-(element-to-element light transfer) is GEOMETRY-ONLY, computed ONCE, reused every step. Albedo stays
-per-Gaussian (so no blocky artifacts); F acts only on the low-frequency bounce term.
-
-  shading:  L_out(g) = rho_g/pi * ( E_direct(g)  +  E_indirect(elem of g) )
-  bounce:   E_indirect_i = sum_j K_ij * B_direct_j ,   B_direct_j = rho_j * E_direct_j     (rho^2 structure)
-  K_ij = max(cos_i,0)*max(cos_j,0)/(pi r^2) * area_j * visibility_ij      (Lambert point-to-patch form factor)
-
-MODE=sanity : validate F reproduces the TRUE bounced light (vs GI ground truth). No optimization.
-MODE=full   : A/B inverse -- recover albedo + light intensity with indirect OFF vs ON; no shadow masking.
-Cornell box, diffuse-only, multi-view, single light (pos known, intensity free). fullcircle env.
-Usage: rt_step2.py [sanity|full] [H] [iters] [gt_spp]"""
-import sys, math, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "thirdparty"))
+"""STEP 2: the precomputed form-factor diffuse bounce, on a DIFFUSE Cornell box (grey sphere), single light
+(position known, intensity FREE). Uses the SHARED operator in giop.py (tune it there). Modes:
+  compare : ours indirect vs path-traced TRUE indirect + full model vs GT photo (single view operator check)
+  measure : floor-vs-wall RGB numbers (ours vs TRUE) + chromaticity figure
+  full    : the A/B inverse -- recover albedo + light with the bounce OFF vs ON; does indirect kill the drift
+Output -> outputs/rt/<CONFIG>/.  fullcircle env.  Usage: rt_step2.py [compare|measure|full] [H] [iters] [gt_spp]"""
+import sys, os, math
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch, numpy as np
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-from threedgrut.datasets.protocols import Batch
-from rt_cornell import GS, tracer, quat_from_normal, plane, sphere
+from rt_cornell import tracer, quat_from_normal, plane, sphere
+from giop import (DEV, PI, EPS, DMIN, BOUNCES, CONFIG, out_dir, feat_gs, orient, srgb, trace, trace_flat,
+                  surf, cosine_sample, shadow_vis, build_elements, build_K, exact_vis_G, radiosity, scatter_mean)
 
-DEV="cuda"; PI=math.pi
-OUT=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "outputs", "rt")
-MODE = sys.argv[1] if len(sys.argv)>1 else "sanity"
-H = int(sys.argv[2]) if len(sys.argv)>2 else 128
-ITERS = int(sys.argv[3]) if len(sys.argv)>3 else 400
-GT_SPP = int(sys.argv[4]) if len(sys.argv)>4 else 256
-W=H; EPS=0.04; DMIN=0.6; GT_NB=3
-VOX=0.18; R_MAX=3.0; KNN=96; BOUNCES=3          # element clustering, form-factor neighborhood, indirect bounces
-
-LIGHT_POS = torch.tensor([0.0,0.9,-0.1], device=DEV)
-LIGHT_INT_TRUE = torch.tensor([7.0,7.0,7.0], device=DEV)
-VIEWS = [((0.0,0.10,3.0),(0,-0.3,-0.2)), ((0.9,0.20,2.9),(0,-0.3,-0.2)), ((-0.9,0.20,2.9),(0,-0.3,-0.2))]
+MODE=sys.argv[1] if len(sys.argv)>1 else "compare"
+H=int(sys.argv[2]) if len(sys.argv)>2 else 160
+ITERS=int(sys.argv[3]) if len(sys.argv)>3 else 300
+GT_SPP=int(sys.argv[4]) if len(sys.argv)>4 else 512
+W=H; GT_NB=3
+LIGHT_POS=torch.tensor([0.0,0.9,-0.1],device=DEV); LIGHT_INT_TRUE=torch.tensor([7.0,7.0,7.0],device=DEV)
+VIEWS=[((0.0,0.10,3.0),(0,-0.3,-0.2)), ((0.9,0.20,2.9),(0,-0.3,-0.2)), ((-0.9,0.20,2.9),(0,-0.3,-0.2))]
 
 
 def build():
     e=lambda *v: torch.tensor(v,device=DEV,dtype=torch.float32)
     RED=e(0.80,0.10,0.10); GREEN=e(0.10,0.70,0.10); WHITE=e(0.75,0.75,0.75); GREY=e(0.70,0.70,0.70)
-    P=[(plane(e(-1,0,0),e(0,0,1),e(0,1,0),e(1,0,0),RED,200,1.0),   1e-4),
-       (plane(e(1,0,0),e(0,0,1),e(0,1,0),e(-1,0,0),GREEN,200,1.0), 1e-4),
-       (plane(e(0,-1,0),e(1,0,0),e(0,0,1),e(0,1,0),WHITE,200,1.0), 1e-4),
-       (plane(e(0,1,0),e(1,0,0),e(0,0,1),e(0,-1,0),WHITE,200,1.0), 1e-4),
-       (plane(e(0,0,-1),e(1,0,0),e(0,1,0),e(0,0,1),WHITE,200,1.0), 1e-4),
-       (sphere(e(0,-0.5,-0.1),0.40,GREY,90000),                    4*PI*0.16/90000)]
+    P=[(plane(e(-1,0,0),e(0,0,1),e(0,1,0),e(1,0,0),RED,200,1.0),1e-4),
+       (plane(e(1,0,0),e(0,0,1),e(0,1,0),e(-1,0,0),GREEN,200,1.0),1e-4),
+       (plane(e(0,-1,0),e(1,0,0),e(0,0,1),e(0,1,0),WHITE,200,1.0),1e-4),
+       (plane(e(0,1,0),e(1,0,0),e(0,0,1),e(0,-1,0),WHITE,200,1.0),1e-4),
+       (plane(e(0,0,-1),e(1,0,0),e(0,1,0),e(0,0,1),WHITE,200,1.0),1e-4),
+       (sphere(e(0,-0.5,-0.1),0.40,GREY,90000),4*PI*0.16/90000)]
     pos=torch.cat([p[0][0] for p in P]); nrm=torch.nn.functional.normalize(torch.cat([p[0][1] for p in P]),dim=-1)
     alb=torch.cat([p[0][2] for p in P]); N=pos.shape[0]
-    a_g=torch.cat([torch.full((p[0][0].shape[0],), p[1], device=DEV) for p in P])
+    a_g=torch.cat([torch.full((p[0][0].shape[0],),p[1],device=DEV) for p in P])
     sp_start=sum(p[0][0].shape[0] for p in P[:-1]); seg={"sp":slice(sp_start,N)}
-    quat=quat_from_normal(nrm); sc=torch.tensor([0.02,0.02,0.004],device=DEV).repeat(N,1)
-    dens=torch.full((N,1),0.99,device=DEV)
-    return dict(pos=pos,nrm=nrm,quat=quat,sc=sc,dens=dens,N=N,seg=seg,alb=alb,a_g=a_g)
+    quat=quat_from_normal(nrm); sc=torch.tensor([0.02,0.02,0.004],device=DEV).repeat(N,1); dens=torch.full((N,1),0.99,device=DEV)
+    return dict(pos=pos,nrm=nrm,quat=quat,sc=sc,dens=dens,N=N,alb=alb,a_g=a_g,seg=seg)
 
 
-def feat_gs(S,color): return GS(S["pos"],S["quat"],S["sc"],S["dens"],color)
-def orient(n,t): return n*torch.sign((n*t).sum(-1,keepdim=True)+1e-9)
+def camera(cpos,tgt):
+    cpos=torch.tensor(cpos,device=DEV); tgt=torch.tensor(tgt,device=DEV)
+    fwd=torch.nn.functional.normalize(tgt-cpos,dim=0); up0=torch.tensor([0.,1,0.],device=DEV)
+    right=torch.nn.functional.normalize(torch.linalg.cross(fwd,up0),dim=0); up=torch.linalg.cross(right,fwd)
+    fl=0.5*W/math.tan(0.5*math.radians(45)); ys,xs=torch.meshgrid(torch.arange(H,device=DEV),torch.arange(W,device=DEV),indexing="ij")
+    pdir=torch.nn.functional.normalize((xs-W/2+0.5)[...,None]/fl*right+(-(ys-H/2+0.5))[...,None]/fl*up+fwd,dim=-1)
+    return cpos.view(1,1,3).expand(H,W,3).contiguous(),pdir
 
-def trace(tr,gs,ori,dirn):
-    dn=torch.nn.functional.normalize(dirn,dim=-1)
-    b=Batch(rays_ori=ori[None].contiguous(),rays_dir=dn[None].contiguous(),T_to_world=torch.eye(4,device=DEV)[None].contiguous())
-    o=tr.render(gs,b); return o["pred_rgb"][0],o["pred_opacity"][0][...,0],o["pred_dist"][0][...,0]
 
-def trace_flat(tr,gs,ori,dirn,chunk=120000):
-    """trace M arbitrary rays -> (op[M], dist[M])."""
-    M=ori.shape[0]; ops=[]; dists=[]
-    for s in range(0,M,chunk):
-        o=ori[s:s+chunk].view(-1,1,3).contiguous(); d=dirn[s:s+chunk].view(-1,1,3).contiguous()
-        _,op,di=trace(tr,gs,o,d); ops.append(op[:,0]); dists.append(di[:,0])
-    return torch.cat(ops),torch.cat(dists)
-
-def surf(tr,gsA,gsN,ori,dirn):
-    alb,op,dist=trace(tr,gsA,ori,dirn); nc,_,_=trace(tr,gsN,ori,dirn)
-    n=torch.nn.functional.normalize(2*nc-1,dim=-1)
-    return (op>0.5).float(),(ori+dist[...,None]*dirn),n,alb
-
-def cosine_sample(n):
-    u1=torch.rand(*n.shape[:-1],1,device=DEV); u2=torch.rand(*n.shape[:-1],1,device=DEV)
-    r=torch.sqrt(u1); phi=2*PI*u2; x=r*torch.cos(phi); y=r*torch.sin(phi); z=torch.sqrt((1-u1).clamp(min=0))
-    ref=torch.where(n[...,2:3].abs()>0.9,torch.tensor([1.,0,0],device=DEV),torch.tensor([0.,0,1.],device=DEV))
-    t1=torch.nn.functional.normalize(torch.linalg.cross(ref,n),dim=-1); t2=torch.linalg.cross(n,t1)
-    return torch.nn.functional.normalize(x*t1+y*t2+z*n,dim=-1)
-
-def shadow_vis(tr,gsA,p,n,lp):
-    lv=lp.view(1,1,3)-p; ld=lv.norm(dim=-1,keepdim=True); l=lv/(ld+1e-9)
-    _,sop,sdist=trace(tr,gsA,p+n*EPS,l)
-    return (~((sop>0.5)&(sdist<ld[...,0]-2*EPS))).float()[...,None]
-
-def diffuse_direct(p,n,alb,hit,lp,lint,vis):
-    lv=lp.view(1,1,3)-p; ld=lv.norm(dim=-1,keepdim=True); l=lv/(ld+1e-9)
-    ndl=torch.relu((n*l).sum(-1,keepdim=True))
-    return alb/PI*ndl*vis*lint.view(1,1,3)/(ld.clamp(min=DMIN)**2)*hit[...,None]
+def diffuse_direct(tr,gsA,p,n,alb,hit,lp,lint):
+    lv=lp.view(1,1,3)-p; ld=lv.norm(dim=-1,keepdim=True); l=lv/(ld+1e-9); ndl=torch.relu((n*l).sum(-1,keepdim=True))
+    vis=shadow_vis(tr,gsA,p,n,lp); return alb/PI*ndl*vis*lint.view(1,1,3)/(ld.clamp(min=DMIN)**2)*hit[...,None]
 
 def render_gt(tr,S,gsA,gsN,cam,pdir,lp,lint,spp,nb):
     hit0,p0,n0,alb0=surf(tr,gsA,gsN,cam,pdir); n0=orient(n0,-pdir); hm0=hit0[...,None]
-    vis0=shadow_vis(tr,gsA,p0,n0,lp); img=diffuse_direct(p0,n0,alb0,hit0,lp,lint,vis0)
+    img=diffuse_direct(tr,gsA,p0,n0,alb0,hit0,lp,lint)
     if spp==0 or nb==0: return img
     ind=torch.zeros(H,W,3,device=DEV)
     for _ in range(spp):
         thr=alb0*hm0; p,n,hit=p0,n0,hit0
         for _b in range(nb):
             d=cosine_sample(n); hb,pb,nb_,albb=surf(tr,gsA,gsN,p+n*EPS,d); nb_=orient(nb_,-d); hbm=(hb*hit)[...,None]
-            vb=shadow_vis(tr,gsA,pb,nb_,lp); ind=ind+thr*diffuse_direct(pb,nb_,albb,hb*hit,lp,lint,vb)
-            thr=thr*albb*hbm; p,n,hit=pb,nb_,hb*hit
+            ind=ind+thr*diffuse_direct(tr,gsA,pb,nb_,albb,hb*hit,lp,lint); thr=thr*albb*hbm; p,n,hit=pb,nb_,hb*hit
     return img+ind/spp
 
-def camera(cpos,tgt):
-    cpos=torch.tensor(cpos,device=DEV); tgt=torch.tensor(tgt,device=DEV)
-    fwd=torch.nn.functional.normalize(tgt-cpos,dim=0); up0=torch.tensor([0.,1,0.],device=DEV)
-    right=torch.nn.functional.normalize(torch.linalg.cross(fwd,up0),dim=0); up=torch.linalg.cross(right,fwd)
-    fl=0.5*W/math.tan(0.5*math.radians(45))
-    ys,xs=torch.meshgrid(torch.arange(H,device=DEV),torch.arange(W,device=DEV),indexing="ij")
-    pdir=torch.nn.functional.normalize((xs-W/2+0.5)[...,None]/fl*right+(-(ys-H/2+0.5))[...,None]/fl*up+fwd,dim=-1)
-    return cpos.view(1,1,3).expand(H,W,3).contiguous(),pdir
 
-def srgb(x): return np.clip(x,0,1)**(1/2.2)
-
-
-# ---------------- elements + form-factor operator (geometry only, computed once) ----------------
-def build_elements(S):
-    pos,nrm=S["pos"],S["nrm"]
-    key=torch.cat([torch.floor(pos/VOX),(nrm).round()],-1)
-    _,eid=torch.unique(key,dim=0,return_inverse=True); E=int(eid.max())+1
-    cnt=torch.zeros(E,device=DEV).index_add_(0,eid,torch.ones(S["N"],device=DEV)).clamp(min=1)
-    cen=torch.zeros(E,3,device=DEV).index_add_(0,eid,pos)/cnt[:,None]
-    nor=torch.nn.functional.normalize(torch.zeros(E,3,device=DEV).index_add_(0,eid,nrm),dim=-1)
-    area=torch.zeros(E,device=DEV).index_add_(0,eid,S["a_g"])
-    return eid,E,cen,nor,area
-
-def build_K(tr,gsA0,eid,E,cen,nor,area,knn=None):
-    """K_ij = max(cos_i,0)max(cos_j,0)/(pi r^2) * area_j * vis_ij. knn=None -> ALL facing visible pairs."""
-    d=cen[None,:,:]-cen[:,None,:]; r=d.norm(dim=-1); u=d/(r[...,None]+1e-9)        # i->j
-    cos_i=torch.relu((nor[:,None,:]*u).sum(-1)); cos_j=torch.relu((-nor[None,:,:]*u).sum(-1))
-    facing=(cos_i>1e-4)&(cos_j>1e-4)&(r>1e-3)&(r<R_MAX)
-    if knn is not None:
-        rr=torch.where(facing,r,torch.full_like(r,1e9)); k=min(knn,E)
-        nbr=rr.topk(k,dim=1,largest=False).indices
-        ii=torch.arange(E,device=DEV)[:,None].expand(-1,k).reshape(-1); jj=nbr.reshape(-1)
-        keep=facing[ii,jj]; ii,jj=ii[keep],jj[keep]
-    else:
-        ii,jj=facing.nonzero(as_tuple=True)                                         # all facing pairs
-    rij=r[ii,jj]; ci=cos_i[ii,jj]; cj=cos_j[ii,jj]
-    Kij=ci*cj*area[jj]/(PI*rij**2 + area[jj])                                       # area form factor (near-field stable)
-    oi=cen[ii]+nor[ii]*EPS; dj=torch.nn.functional.normalize(cen[jj]-cen[ii],dim=-1)
-    op,dist=trace_flat(tr,gsA0,oi,dj); occ=(op>0.5)&(dist<rij-3*EPS)
-    Kij=Kij*(~occ).float()
-    K=torch.zeros(E,E,device=DEV); K[ii,jj]=Kij
-    V=torch.ones(E,E,device=DEV); V[ii,jj]=(~occ).float()                            # patch-patch visibility (1=visible)
-    return K, V, int(ii.shape[0])
-
-
-def pixel_element(p, n, cen, nor, chunk=20000):
-    """nearest normal-compatible element for each pixel -> lets us gate the gather by patch visibility."""
-    HW=p.shape[0]*p.shape[1]; pf=p.reshape(-1,3); nf=n.reshape(-1,3); out=torch.zeros(HW,dtype=torch.long,device=DEV)
-    for s in range(0,HW,chunk):
-        d=(pf[s:s+chunk][:,None,:]-cen[None,:,:]).norm(dim=-1)
-        d=torch.where((nf[s:s+chunk]@nor.T)>0.5, d, torch.full_like(d,1e9))
-        out[s:s+chunk]=d.argmin(dim=1)
-    return out
-
-
-def pixel_weights(p, n, cen, nor, k=8, chunk=16000):
-    """per-pixel soft weights to its k nearest normal-compatible patches (for smooth visibility blend)."""
-    HW=p.shape[0]*p.shape[1]; pf=p.reshape(-1,3); nf=n.reshape(-1,3)
-    nbr=torch.zeros(HW,k,dtype=torch.long,device=DEV); w=torch.zeros(HW,k,device=DEV)
-    for s in range(0,HW,chunk):
-        d=(pf[s:s+chunk][:,None,:]-cen[None,:,:]).norm(dim=-1)
-        d=torch.where((nf[s:s+chunk]@nor.T)>0.5, d, torch.full_like(d,1e9))
-        vals,idx=d.topk(k,dim=1,largest=False)
-        ww=torch.exp(-(vals**2)/(2*VOX**2)); ww=ww/ww.sum(-1,keepdim=True).clamp(min=1e-9)
-        nbr[s:s+chunk]=idx; w[s:s+chunk]=ww
-    return nbr,w
-
-
-def exact_vis_G(tr, gsA0, p, n, cen, nor, area, pchunk=2000):
-    """EXACT per-pixel visibility: trace a ray from each pixel to each emitter patch, gate the gather by it.
-    Geometry-only -> precomputed once. Removes the coarse patch-level visibility approximation."""
-    HW=p.shape[0]*p.shape[1]; E=cen.shape[0]; pf=p.reshape(-1,3); nf=n.reshape(-1,3)
-    G=view_G(p,n,cen,nor,area); vis=torch.empty(HW,E,device=DEV)
-    for s in range(0,HW,pchunk):
-        ps=pf[s:s+pchunk]; ns=nf[s:s+pchunk]; c=ps.shape[0]
-        d=cen[None,:,:]-ps[:,None,:]; r=d.norm(dim=-1); u=d/(r[...,None]+1e-9)        # (c,E,3)
-        ori=(ps[:,None,:]+ns[:,None,:]*EPS).expand(-1,E,-1).reshape(-1,3)
-        op,dist=trace_flat(tr,gsA0,ori,u.reshape(-1,3))
-        vis[s:s+pchunk]=(~((op>0.5)&(dist<r.reshape(-1)-3*EPS))).float().view(c,E)
-    clo=(1.0/G.sum(1,keepdim=True).clamp(min=0.3)).clamp(max=1.6)                     # closure normalization
-    return G*vis*clo
-
-
-def gated_G(G, Vis, nbr, w, chunk=2048):
-    """bake SOFT per-pixel visibility into G: each pixel blends its k-nearest patches' visibility rows,
-    so the shadow boundary is smooth (no patch-step squares). Geometry-only -> precomputed once per view."""
-    HW=G.shape[0]; out=torch.empty_like(G)
-    clo=(1.0/G.sum(1,keepdim=True).clamp(min=0.3)).clamp(max=1.6)                     # closure norm: fix ~18% discretization energy loss (capped for open front)
-    for s in range(0,HW,chunk):
-        vs=(w[s:s+chunk][:,:,None]*Vis[nbr[s:s+chunk]]).sum(1)                       # (c,E) soft visibility
-        out[s:s+chunk]=G[s:s+chunk]*vs*clo[s:s+chunk]
-    return out
-
-
-def smooth_weights(S, cen, nor, k=8, chunk=20000):
-    """per-Gaussian interpolation weights from its k nearest (normal-compatible) element centroids ->
-    reconstructs a SMOOTH indirect field from the coarse element values (kills the blocky squares)."""
-    N=S["N"]; pos=S["pos"]; ng=S["nrm"]; nbr=torch.zeros(N,k,dtype=torch.long,device=DEV); w=torch.zeros(N,k,device=DEV)
-    for s in range(0,N,chunk):
-        ps=pos[s:s+chunk]; ns=ng[s:s+chunk]
-        dist=(ps[:,None,:]-cen[None,:,:]).norm(dim=-1)                               # (c,E)
-        dist=torch.where((ns@nor.T)>0.5, dist, torch.full_like(dist,1e9))
-        vals,idx=dist.topk(k,dim=1,largest=False)
-        ww=torch.exp(-(vals**2)/(2*VOX**2)); ww=ww/ww.sum(-1,keepdim=True).clamp(min=1e-9)
-        nbr[s:s+chunk]=idx; w[s:s+chunk]=ww
-    return nbr,w
-
-def smooth_apply(Eelem, nbr, w): return (Eelem[nbr]*w[...,None]).sum(1)              # (E,3),(N,k),(N,k)->(N,3)
-
-
-def view_G(p, n, cen, nor, area, chunk=4096):
-    """per-PIXEL receiver gather matrix G[pix,j] = max(n_pix.u,0)*max(-n_j.u,0)/(pi r^2)*area_j.
-    Uses each pixel's OWN position/normal (no interpolation, geometry-correct, corners darken naturally).
-    Geometry-only & fixed per view -> precomputed once. Indirect visibility omitted (soft fill)."""
-    HW=p.shape[0]*p.shape[1]; E=cen.shape[0]; pf=p.reshape(-1,3); nf=n.reshape(-1,3)
-    G=torch.zeros(HW,E,device=DEV)
-    for s in range(0,HW,chunk):
-        pc=pf[s:s+chunk]; nc=nf[s:s+chunk]
-        d=cen[None,:,:]-pc[:,None,:]; r=d.norm(dim=-1).clamp(min=0.06); u=d/r[...,None]   # near-field clamp -> fewer edge waves
-        cos_i=torch.relu((nc[:,None,:]*u).sum(-1)); cos_j=torch.relu((-nor[None,:,:]*u).sum(-1))
-        G[s:s+chunk]=cos_i*cos_j*area[None,:]/(PI*r**2 + area[None,:])              # area form factor (near-field stable)
-    return G                                                                          # (HW, E)
-
-
-def radiosity(rho_elem, Edir_elem, K, terms):
-    """multi-bounce element radiosity. terms=1 -> direct response only; terms=2 -> + one inter-element bounce.
-    inter-element transfer K already carries (coarse) patch-to-patch visibility."""
-    B0=rho_elem*Edir_elem; acc=B0; cur=B0
-    for _ in range(terms-1):
-        cur=rho_elem*(K@cur); acc=acc+cur
-    return acc                                                                        # (E,3) total outgoing
-
-def scatter_mean(x,eid,E):
-    cnt=torch.zeros(E,device=x.device).index_add_(0,eid,torch.ones(x.shape[0],device=x.device)).clamp(min=1)
-    s=torch.zeros(E,x.shape[1],device=x.device).index_add_(0,eid,x); return s/cnt[:,None]
-
-
-def precompute(tr,S,gsA0,gsN):
-    """per-Gaussian direct geometry (fac_g), per-view (fac_pix, GT photos), elements + K."""
-    n_g=orient(S["nrm"], LIGHT_POS.view(1,3)-S["pos"])                              # face the lamp
-    lv=LIGHT_POS.view(1,3)-S["pos"]; ld=lv.norm(dim=-1,keepdim=True); l=lv/(ld+1e-9)
-    opg,dg=trace_flat(tr,gsA0,S["pos"]+n_g*EPS,l.expand(-1,3))
-    visg=(~((opg>0.5)&(dg<ld[:,0]-2*EPS))).float()
-    fac_g=torch.relu((n_g*l).sum(-1))*visg/(ld[:,0].clamp(min=DMIN)**2)             # (N,) cos*vis/d^2
-    eid,E,cen,nor,area=build_elements(S)
-    K,Vis,dens=build_K(tr,gsA0,eid,E,cen,nor,area)
-    mean_fac_elem=torch.zeros(E,device=DEV).index_add_(0,eid,fac_g)/torch.zeros(E,device=DEV).index_add_(0,eid,torch.ones(S["N"],device=DEV)).clamp(min=1)
+def prep(tr,S,gsA0,gsN):
+    """shared geometry: elements, K, per-Gaussian direct-to-light factor, and per-view (cam, G, GT photo)."""
+    ng=orient(S["nrm"],LIGHT_POS.view(1,3)-S["pos"]); lvg=LIGHT_POS.view(1,3)-S["pos"]; ldg=lvg.norm(dim=-1,keepdim=True); lg=lvg/(ldg+1e-9)
+    opg,dg=trace_flat(tr,gsA0,S["pos"]+ng*EPS,lg); visg=(~((opg>0.5)&(dg<ldg[:,0]-2*EPS))).float()
+    facg=torch.relu((ng*lg).sum(-1))*visg/(ldg[:,0].clamp(min=DMIN)**2)
+    eid,E,cen,nor,area,cntN=build_elements(S); K=build_K(tr,gsA0,cen,nor,area); mean_fac_elem=torch.zeros(E,device=DEV).index_add_(0,eid,facg)/cntN
     views=[]
     for cp,tg in VIEWS:
         cam,pdir=camera(cp,tg); hit0,p0,n0,alb_t=surf(tr,gsA0,gsN,cam,pdir); n0=orient(n0,-pdir)
-        vis0=shadow_vis(tr,gsA0,p0,n0,LIGHT_POS)
-        lv=LIGHT_POS.view(1,1,3)-p0; ldp=lv.norm(dim=-1,keepdim=True); lp_=lv/(ldp+1e-9)
-        fac_pix=torch.relu((n0*lp_).sum(-1,keepdim=True))*vis0/(ldp.clamp(min=DMIN)**2)
-        GTgi=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,GT_SPP,GT_NB).detach()
-        GTdir=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,0,0).detach()
-        G=exact_vis_G(tr,gsA0,p0,n0,cen,nor,area)                                    # exact per-pixel visibility (consistent with compare)
-        views.append(dict(cam=cam,pdir=pdir,hit=hit0,p=p0,n=n0,alb_t=alb_t,fac=fac_pix,GTgi=GTgi,GTdir=GTdir,G=G))
-    return dict(fac_g=fac_g,eid=eid,E=E,K=K,V=Vis,Kdens=dens,mean_fac_elem=mean_fac_elem,views=views,
-                cen=cen,nor=nor,area=area)
+        lv=LIGHT_POS.view(1,1,3)-p0; ld=lv.norm(dim=-1,keepdim=True); l=lv/(ld+1e-9)
+        fac=torch.relu((n0*l).sum(-1,keepdim=True))*shadow_vis(tr,gsA0,p0,n0,LIGHT_POS)/(ld.clamp(min=DMIN)**2)
+        G=exact_vis_G(tr,gsA0,p0,n0,cen,nor,area)
+        GT=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,GT_SPP,GT_NB).detach()
+        views.append(dict(cam=cam,pdir=pdir,hit=hit0,p=p0,n=n0,alb_t=alb_t,fac=fac,G=G,GT=GT))
+    return dict(eid=eid,E=E,K=K,mean_fac_elem=mean_fac_elem,views=views)
 
 
-def indirect_pix(tr, S, rho_g, lint, PC, view):
-    """per-PIXEL receiver gather of multi-bounce indirect irradiance (differentiable in rho_g, lint).
-    elements bounce among themselves via K (coarse, with visibility); G projects to pixels (own geometry)."""
-    eid,E,K=PC["eid"],PC["E"],PC["K"]
-    rho_elem=scatter_mean(rho_g,eid,E)
-    Edir_elem=lint.view(1,3)*PC["mean_fac_elem"][:,None]
-    B=radiosity(rho_elem,Edir_elem,K,BOUNCES)                          # (E,3) multi-bounce element radiosity
-    return (view["G"]@B).view(H,W,3)                                   # G is already soft-visibility-gated; per-pixel
-
-
-def render_model(tr,S,gsA,rho_g,lint,PC,view,use_gi):
-    ap,_,_=trace(tr,gsA,view["cam"],view["pdir"])                       # per-pixel albedo (differentiable)
-    direct=ap/PI*view["fac"]*lint.view(1,1,3)
-    if not use_gi: return direct
-    eind=indirect_pix(tr,S,rho_g,lint,PC,view)
-    return direct + ap/PI*eind
-
-
-# ---------------------------------------------------------------- SANITY: does F reproduce true bounce?
-def stage_sanity():
-    S=build(); tr=tracer(); gsA0=feat_gs(S,S["alb"]); gsN=feat_gs(S,0.5*(S["nrm"]+1)); tr.build_acc(gsA0,rebuild=True)
-    print(f"STEP2 SANITY | {H}x{W} | GT spp={GT_SPP} nb={GT_NB} | vox={VOX} knn={KNN}")
-    PC=precompute(tr,S,gsA0,gsN)
-    print(f"  elements E={PC['E']} | K nonzero-frac(of knn) {PC['Kdens']:.2f}")
-    V0=PC["views"][0]
-    with torch.no_grad():
-        eind=indirect_pix(tr,S,S["alb"],LIGHT_INT_TRUE,PC,V0)
-        ap,_,_=trace(tr,gsA0,V0["cam"],V0["pdir"])
-        ff_indirect=ap/PI*eind                                          # form-factor one-bounce indirect (rendered)
-        true_indirect=(V0["GTgi"]-V0["GTdir"]).clamp(min=0)             # GI minus direct = true (multi-bounce) indirect
-        m=(V0["hit"]>0)
-        ti=true_indirect[m]; fi=ff_indirect[m]
-        ratio=float(fi.mean()/(ti.mean()+1e-9)); rel=float((fi-ti).abs().mean()/(ti.mean()+1e-9))
-    print(f"  TRUE indirect mean {float(true_indirect[m].mean()):.4f} | FORM-FACTOR indirect mean {float(ff_indirect[m].mean()):.4f}")
-    print(f"  magnitude ratio (ff/true) {ratio:.2f} | relative abs err {rel:.2f}")
-    print("  (one form-factor bounce approximates the FIRST bounce; multi-bounce GT is a bit larger -> ratio<1 ok)")
-    to=lambda t:(t*m[...,None]).detach().cpu().numpy()
-    fig,ax=plt.subplots(1,3,figsize=(15,5))
-    ax[0].imshow(srgb(to(true_indirect*4))); ax[0].set_title("TRUE indirect x4 (GI - direct)")
-    ax[1].imshow(srgb(to(ff_indirect*4)));   ax[1].set_title(f"FORM-FACTOR indirect x4 (ratio {ratio:.2f})")
-    ax[2].imshow(srgb(to(V0["GTgi"])));      ax[2].set_title("GT photo (full GI)")
-    for a in ax: a.axis("off")
-    fig.suptitle("Step 2 SANITY: does the precomputed form-factor bounce reproduce the true bounced light?", fontsize=12)
-    fig.tight_layout(); fig.savefig(os.path.join(OUT,"step2_sanity.png"),dpi=110); plt.close(fig)
-    print("saved -> outputs/rt/step2_sanity.png")
-
-
-# ---------------------------------------------------------------- FULL: A/B inverse, indirect OFF vs ON
-def optimize(tr,S,PC,use_gi,iters,tag):
-    alb_raw=torch.nn.Parameter(torch.zeros(S["N"],3,device=DEV)); lint_raw=torch.nn.Parameter(LIGHT_INT_TRUE.clone())
-    opt=torch.optim.Adam([{"params":[alb_raw],"lr":0.05},{"params":[lint_raw],"lr":0.2}])
-    for it in range(iters):
-        rho=torch.sigmoid(alb_raw); gsA=feat_gs(S,rho); lint=lint_raw.clamp(min=0.05); loss=0.0
-        for V in PC["views"]:
-            model=render_model(tr,S,gsA,rho,lint,PC,V,use_gi)
-            loss=loss+((model-V["GTgi"]).abs()*(V["hit"][...,None])).mean()        # no masking: fit all hit pixels
-        opt.zero_grad(); loss.backward(); opt.step()
-        if it<2 or it%80==0: print(f"  [{tag}] it {it:3d} loss {float(loss):.4f} lint {[round(float(x),2) for x in lint.clamp(min=0.05)]}")
-    with torch.no_grad():
-        rho=torch.sigmoid(alb_raw); gsA=feat_gs(S,rho); lint=lint_raw.clamp(min=0.05)
-        rec,_,_=trace(tr,gsA,PC["views"][0]["cam"],PC["views"][0]["pdir"])
-    return rec.detach(), lint.detach()
-
-def stage_full():
-    S=build(); tr=tracer(); gsA0=feat_gs(S,S["alb"]); gsN=feat_gs(S,0.5*(S["nrm"]+1)); tr.build_acc(gsA0,rebuild=True)
-    print(f"STEP2 FULL A/B | {H}x{W} | iters={ITERS} | indirect OFF vs ON")
-    PC=precompute(tr,S,gsA0,gsN); print(f"  elements E={PC['E']}")
-    V0=PC["views"][0]; true=V0["alb_t"]
-    recOFF,lintOFF=optimize(tr,S,PC,False,ITERS,"noGI")
-    recON ,lintON =optimize(tr,S,PC,True ,ITERS,"GI")
-    with torch.no_grad():
-        seg_col=torch.zeros(S["N"],3,device=DEV); seg_col[S["seg"]["sp"]]=1.0
-        spix,_,_=trace(tr,feat_gs(S,seg_col),V0["cam"],V0["pdir"]); sph=(spix[...,0]>0.5)&(V0["hit"]>0)
-        def stats(rec):
-            sv=rec[sph]; tv=true[sph]; mean=[round(float(x),2) for x in sv.mean(0)]
-            raw=float((rec[V0["hit"]>0]-true[V0["hit"]>0]).abs().mean()); return mean,raw
-        mOFF,rOFF=stats(recOFF); mON,rON=stats(recON)
-    print(f"STEP2 RESULT (sphere true mean [0.70,0.70,0.70], light true [7,7,7])")
-    print(f"  indirect OFF: sphere {mOFF} | raw_err {rOFF:.4f} | light {[round(float(x),2) for x in lintOFF]}")
-    print(f"  indirect ON : sphere {mON} | raw_err {rON:.4f} | light {[round(float(x),2) for x in lintON]}")
-    to=lambda t:(t*(V0["hit"][...,None])).detach().cpu().numpy()
-    fig,ax=plt.subplots(1,3,figsize=(15,5))
-    ax[0].imshow(srgb(to(true)));   ax[0].set_title("TRUE albedo")
-    ax[1].imshow(srgb(to(recOFF))); ax[1].set_title(f"recovered: NO indirect (sphere {mOFF}, light {[round(float(x)) for x in lintOFF]})")
-    ax[2].imshow(srgb(to(recON)));  ax[2].set_title(f"recovered: + form-factor bounce (sphere {mON}, light {[round(float(x)) for x in lintON]})")
-    for a in ax: a.axis("off")
-    fig.suptitle("Step 2 A/B: does one precomputed diffuse bounce kill the albedo<->light drift?", fontsize=12)
-    fig.tight_layout(); fig.savefig(os.path.join(OUT,"step2_ab.png"),dpi=110); plt.close(fig)
-    print("saved -> outputs/rt/step2_ab.png")
-
-
-def stage_walk():
-    """validate the PER-PIXEL receiver gather (smooth + geometry-correct) against HIGH-QUALITY GT."""
-    S=build(); tr=tracer(); gsA0=feat_gs(S,S["alb"]); gsN=feat_gs(S,0.5*(S["nrm"]+1)); tr.build_acc(gsA0,rebuild=True)
-    print(f"STEP2 WALK (per-pixel gather) | {H}x{W} | GT spp={GT_SPP} nb={GT_NB} | vox={VOX} bounces={BOUNCES}")
-    n_g=orient(S["nrm"], LIGHT_POS.view(1,3)-S["pos"])
-    lv=LIGHT_POS.view(1,3)-S["pos"]; ld=lv.norm(dim=-1,keepdim=True); l=lv/(ld+1e-9)
-    opg,dg=trace_flat(tr,gsA0,S["pos"]+n_g*EPS,l); visg=(~((opg>0.5)&(dg<ld[:,0]-2*EPS))).float()
-    fac_g=torch.relu((n_g*l).sum(-1))*visg/(ld[:,0].clamp(min=DMIN)**2)
-    eid,E,cen,nor,area=build_elements(S)
-    cntN=torch.zeros(E,device=DEV).index_add_(0,eid,torch.ones(S["N"],device=DEV)).clamp(min=1)
-    mean_fac_elem=torch.zeros(E,device=DEV).index_add_(0,eid,fac_g)/cntN
-    K,Vis,nfull=build_K(tr,gsA0,eid,E,cen,nor,area,knn=None)
-    print(f"  elements E={E} | K pairs(full) {nfull}")
-    smean=lambda x:(torch.zeros(E,x.shape[1],device=DEV).index_add_(0,eid,x))/cntN[:,None]
-    rho_elem=smean(S["alb"]); Edir_elem=LIGHT_INT_TRUE.view(1,3)*mean_fac_elem[:,None]
-
-    cam,pdir=camera(*VIEWS[0]); hit0,p0,n0,alb_t=surf(tr,gsA0,gsN,cam,pdir); n0=orient(n0,-pdir); m=(hit0>0)
-    G=view_G(p0,n0,cen,nor,area); pe=pixel_element(p0,n0,cen,nor); Geff=G*Vis[pe]      # visibility-gated gather
-    GTgi=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,GT_SPP,GT_NB)
-    GTdir=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,0,0)
-    true_ind=(GTgi-GTdir).clamp(min=0); ap,_,_=trace(tr,gsA0,cam,pdir)
-    B1=radiosity(rho_elem,Edir_elem,K,1); B2=radiosity(rho_elem,Edir_elem,K,2)
-    ind1=ap/PI*(Geff@B1).view(H,W,3); ind2=ap/PI*(Geff@B2).view(H,W,3)                 # per-pixel indirect radiance
-    lvp=LIGHT_POS.view(1,1,3)-p0; ldp=lvp.norm(dim=-1,keepdim=True); lpp=lvp/(ldp+1e-9)
-    vis0=shadow_vis(tr,gsA0,p0,n0,LIGHT_POS)
-    direct=ap/PI*torch.relu((n0*lpp).sum(-1,keepdim=True))*vis0*LIGHT_INT_TRUE.view(1,1,3)/(ldp.clamp(min=DMIN)**2)
-    model=direct+ind2
-    tmean=float(true_ind[m].mean()); rr=lambda img:round(float(img[m].mean())/(tmean+1e-9),2)
-    merr=float((model[m]-GTgi[m]).abs().mean())
-    print(f"  indirect ratio vs true: per-pixel 1-bounce {rr(ind1)} | 2-bounce {rr(ind2)}")
-    print(f"  full model (direct+2b) vs GT photo: mean abs err {merr:.4f}")
-    to=lambda t:(t*m[...,None]).detach().cpu().numpy()
-    fig,ax=plt.subplots(2,3,figsize=(15,9))
-    ax[0,0].imshow(srgb(to(true_ind*4)));  ax[0,0].set_title("TRUE indirect x4 (high-q GT)")
-    ax[0,1].imshow(srgb(to(ind1*4)));      ax[0,1].set_title(f"per-pixel 1-bounce x4 (ratio {rr(ind1)})")
-    ax[0,2].imshow(srgb(to(ind2*4)));      ax[0,2].set_title(f"per-pixel 2-bounce x4 (ratio {rr(ind2)})")
-    ax[1,0].imshow(srgb(to(model)));       ax[1,0].set_title("full model: direct + 2-bounce")
-    ax[1,1].imshow(srgb(to(GTgi)));        ax[1,1].set_title("GT photo (full GI)")
-    ax[1,2].imshow(srgb(to((model-GTgi).abs()*3))); ax[1,2].set_title(f"|model - GT| x3 (err {merr:.4f})")
-    for a in ax.ravel(): a.axis("off")
-    fig.suptitle("Step 2 WALKTHROUGH (per-pixel gather): indirect 1/2-bounce vs TRUE, and full model vs GT photo", fontsize=12)
-    fig.tight_layout(); fig.savefig(os.path.join(OUT,"step2_walk.png"),dpi=110); plt.close(fig)
-    print("saved -> outputs/rt/step2_walk.png")
-
-
-def stage_bounces():
-    """settle 'is floor-green a bounce-count issue?': path-traced TRUE indirect at nb=1,2,3 (top row) vs
-    my form-factor operator at matching bounce counts (bottom row). See WHEN the floor color appears."""
-    S=build(); tr=tracer(); gsA0=feat_gs(S,S["alb"]); gsN=feat_gs(S,0.5*(S["nrm"]+1)); tr.build_acc(gsA0,rebuild=True)
-    print(f"STEP2 BOUNCE-SWEEP | {H}x{W} | GT spp={GT_SPP} | vox={VOX}")
-    n_g=orient(S["nrm"], LIGHT_POS.view(1,3)-S["pos"])
-    lv=LIGHT_POS.view(1,3)-S["pos"]; ld=lv.norm(dim=-1,keepdim=True); l=lv/(ld+1e-9)
-    opg,dg=trace_flat(tr,gsA0,S["pos"]+n_g*EPS,l); visg=(~((opg>0.5)&(dg<ld[:,0]-2*EPS))).float()
-    fac_g=torch.relu((n_g*l).sum(-1))*visg/(ld[:,0].clamp(min=DMIN)**2)
-    eid,E,cen,nor,area=build_elements(S)
-    cntN=torch.zeros(E,device=DEV).index_add_(0,eid,torch.ones(S["N"],device=DEV)).clamp(min=1)
-    mean_fac_elem=torch.zeros(E,device=DEV).index_add_(0,eid,fac_g)/cntN
-    K,Vis,_=build_K(tr,gsA0,eid,E,cen,nor,area,knn=None)
-    smean=lambda x:(torch.zeros(E,x.shape[1],device=DEV).index_add_(0,eid,x))/cntN[:,None]
-    rho_elem=smean(S["alb"]); Edir_elem=LIGHT_INT_TRUE.view(1,3)*mean_fac_elem[:,None]
-    cam,pdir=camera(*VIEWS[0]); hit0,p0,n0,alb_t=surf(tr,gsA0,gsN,cam,pdir); n0=orient(n0,-pdir); m=(hit0>0)
-    G=view_G(p0,n0,cen,nor,area); pe=pixel_element(p0,n0,cen,nor); Geff=G*Vis[pe]; ap,_,_=trace(tr,gsA0,cam,pdir)
-    GTdir=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,0,0)
-    print(f"  elements E={E}; rendering path-traced indirect nb=1,2,3 ...")
-    ti=[(render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,GT_SPP,b)-GTdir).clamp(min=0) for b in (1,2,3)]
-    ff=[ap/PI*(Geff@radiosity(rho_elem,Edir_elem,K,b)).view(H,W,3) for b in (1,2,3)]
-    to=lambda t:(t*m[...,None]).detach().cpu().numpy()
-    fig,ax=plt.subplots(2,3,figsize=(15,9))
-    for j,b in enumerate((1,2,3)):
-        ax[0,j].imshow(srgb(to(ti[j]*4))); ax[0,j].set_title(f"PATH-TRACED indirect, {b} bounce x4")
-        ax[1,j].imshow(srgb(to(ff[j]*4))); ax[1,j].set_title(f"FORM-FACTOR indirect, {b} bounce x4")
-    for a in ax.ravel(): a.axis("off")
-    fig.suptitle("Does floor-green need more bounces? top = path-traced GT at 1/2/3 bounces, bottom = our operator", fontsize=12)
-    fig.tight_layout(); fig.savefig(os.path.join(OUT,"step2_bounces.png"),dpi=110); plt.close(fig)
-    print("saved -> outputs/rt/step2_bounces.png")
-
-
-def stage_debug():
-    """show the visibility-gate fix: ungated vs gated operator indirect vs path-traced (under-sphere color)."""
-    S=build(); tr=tracer(); gsA0=feat_gs(S,S["alb"]); gsN=feat_gs(S,0.5*(S["nrm"]+1)); tr.build_acc(gsA0,rebuild=True)
-    print(f"STEP2 DEBUG (visibility gate) | {H}x{W} | GT spp={GT_SPP} | vox={VOX}")
-    n_g=orient(S["nrm"], LIGHT_POS.view(1,3)-S["pos"])
-    lv=LIGHT_POS.view(1,3)-S["pos"]; ld=lv.norm(dim=-1,keepdim=True); l=lv/(ld+1e-9)
-    opg,dg=trace_flat(tr,gsA0,S["pos"]+n_g*EPS,l); visg=(~((opg>0.5)&(dg<ld[:,0]-2*EPS))).float()
-    fac_g=torch.relu((n_g*l).sum(-1))*visg/(ld[:,0].clamp(min=DMIN)**2)
-    eid,E,cen,nor,area=build_elements(S)
-    cntN=torch.zeros(E,device=DEV).index_add_(0,eid,torch.ones(S["N"],device=DEV)).clamp(min=1)
-    mean_fac_elem=torch.zeros(E,device=DEV).index_add_(0,eid,fac_g)/cntN
-    K,Vis,_=build_K(tr,gsA0,eid,E,cen,nor,area,knn=None)
-    smean=lambda x:(torch.zeros(E,x.shape[1],device=DEV).index_add_(0,eid,x))/cntN[:,None]
-    rho_elem=smean(S["alb"]); Edir_elem=LIGHT_INT_TRUE.view(1,3)*mean_fac_elem[:,None]
-    cam,pdir=camera(*VIEWS[0]); hit0,p0,n0,alb_t=surf(tr,gsA0,gsN,cam,pdir); n0=orient(n0,-pdir); m=(hit0>0)
-    G=view_G(p0,n0,cen,nor,area); pe=pixel_element(p0,n0,cen,nor); Geff=G*Vis[pe]; ap,_,_=trace(tr,gsA0,cam,pdir)
-    print(f"  E={E} | rowsum G ungated {float(G.sum(1).mean()):.2f} | gated {float(Geff.sum(1).mean()):.2f}")
-    B=radiosity(rho_elem,Edir_elem,K,BOUNCES)
-    ind_un=ap/PI*(G@B).view(H,W,3); ind_g=ap/PI*(Geff@B).view(H,W,3)
-    lvp=LIGHT_POS.view(1,1,3)-p0; ldp=lvp.norm(dim=-1,keepdim=True); lpp=lvp/(ldp+1e-9); vis0=shadow_vis(tr,gsA0,p0,n0,LIGHT_POS)
-    direct=ap/PI*torch.relu((n0*lpp).sum(-1,keepdim=True))*vis0*LIGHT_INT_TRUE.view(1,1,3)/(ldp.clamp(min=DMIN)**2)
-    GTgi=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,GT_SPP,GT_NB)
-    GTdir=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,0,0); true_ind=(GTgi-GTdir).clamp(min=0)
-    to=lambda t:(t*m[...,None]).detach().cpu().numpy()
-    fig,ax=plt.subplots(2,3,figsize=(15,9))
-    ax[0,0].imshow(srgb(to(ind_un*4)));      ax[0,0].set_title("indirect UNGATED x4 (no under-sphere color)")
-    ax[0,1].imshow(srgb(to(ind_g*4)));       ax[0,1].set_title("indirect GATED x4 (visibility added)")
-    ax[0,2].imshow(srgb(to(true_ind*4)));    ax[0,2].set_title("TRUE indirect x4 (path-traced target)")
-    ax[1,0].imshow(srgb(to(direct+ind_g)));  ax[1,0].set_title("full model: direct + gated indirect")
-    ax[1,1].imshow(srgb(to(GTgi)));          ax[1,1].set_title("GT photo (full GI)")
-    ax[1,2].imshow(srgb(to((direct+ind_g-GTgi).abs()*3))); ax[1,2].set_title("|model - GT| x3")
-    for a in ax.ravel(): a.axis("off")
-    fig.suptitle("Step 2 DEBUG: visibility-gated gather -- does the under-sphere red/green bleed come back?", fontsize=12)
-    fig.tight_layout(); fig.savefig(os.path.join(OUT,"step2_debug.png"),dpi=110); plt.close(fig)
-    print("saved -> outputs/rt/step2_debug.png")
+def indirect(tr,S,rho,I,PC,V):
+    rho_e=scatter_mean(rho,PC["eid"],PC["E"]); B=radiosity(rho_e,I.view(1,3)*PC["mean_fac_elem"][:,None],PC["K"])
+    return (V["G"]@B).view(H,W,3)
 
 
 def stage_compare():
-    """high-quality clean comparison with both fixes (soft visibility + near-field-stable coarser patches)."""
     S=build(); tr=tracer(); gsA0=feat_gs(S,S["alb"]); gsN=feat_gs(S,0.5*(S["nrm"]+1)); tr.build_acc(gsA0,rebuild=True)
-    print(f"STEP2 COMPARE | {H}x{W} | GT spp={GT_SPP} nb={GT_NB} | vox={VOX} bounces={BOUNCES}")
-    n_g=orient(S["nrm"], LIGHT_POS.view(1,3)-S["pos"])
-    lv=LIGHT_POS.view(1,3)-S["pos"]; ld=lv.norm(dim=-1,keepdim=True); l=lv/(ld+1e-9)
-    opg,dg=trace_flat(tr,gsA0,S["pos"]+n_g*EPS,l); visg=(~((opg>0.5)&(dg<ld[:,0]-2*EPS))).float()
-    fac_g=torch.relu((n_g*l).sum(-1))*visg/(ld[:,0].clamp(min=DMIN)**2)
-    eid,E,cen,nor,area=build_elements(S)
-    cntN=torch.zeros(E,device=DEV).index_add_(0,eid,torch.ones(S["N"],device=DEV)).clamp(min=1)
-    mean_fac_elem=torch.zeros(E,device=DEV).index_add_(0,eid,fac_g)/cntN
-    K,Vis,_=build_K(tr,gsA0,eid,E,cen,nor,area,knn=None)
-    smean=lambda x:(torch.zeros(E,x.shape[1],device=DEV).index_add_(0,eid,x))/cntN[:,None]
-    rho_elem=smean(S["alb"]); Edir_elem=LIGHT_INT_TRUE.view(1,3)*mean_fac_elem[:,None]
-    cam,pdir=camera(*VIEWS[0]); hit0,p0,n0,alb_t=surf(tr,gsA0,gsN,cam,pdir); n0=orient(n0,-pdir); m=(hit0>0)
-    G=exact_vis_G(tr,gsA0,p0,n0,cen,nor,area)                                         # exact per-pixel visibility
-    print(f"  E={E}; rendering high-q GT ...")
-    B=radiosity(rho_elem,Edir_elem,K,BOUNCES); ind=alb_t/PI*(G@B).view(H,W,3)
-    lvp=LIGHT_POS.view(1,1,3)-p0; ldp=lvp.norm(dim=-1,keepdim=True); lpp=lvp/(ldp+1e-9); vis0=shadow_vis(tr,gsA0,p0,n0,LIGHT_POS)
-    direct=alb_t/PI*torch.relu((n0*lpp).sum(-1,keepdim=True))*vis0*LIGHT_INT_TRUE.view(1,1,3)/(ldp.clamp(min=DMIN)**2)
-    model=direct+ind
-    GTgi=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,GT_SPP,GT_NB)
-    GTdir=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,0,0); true_ind=(GTgi-GTdir).clamp(min=0)
-    merr=float((model[m]-GTgi[m]).abs().mean()); ratio=round(float(ind[m].mean()/(true_ind[m].mean()+1e-9)),2)
-    print(f"  indirect mean ratio vs true {ratio} | full model vs GT photo mean abs err {merr:.4f}")
+    print(f"STEP2 COMPARE | {H}x{W} GT spp={GT_SPP} | config {CONFIG}")
+    PC=prep(tr,S,gsA0,gsN); V=PC["views"][0]; m=(V["hit"]>0); ap=V["alb_t"]
+    ind=ap/PI*indirect(tr,S,S["alb"],LIGHT_INT_TRUE,PC,V)
+    direct=ap/PI*V["fac"]*LIGHT_INT_TRUE.view(1,1,3); model=direct+ind
+    GTdir=render_gt(tr,S,gsA0,gsN,V["cam"],V["pdir"],LIGHT_POS,LIGHT_INT_TRUE,0,0); true_ind=(V["GT"]-GTdir).clamp(min=0)
+    ratio=round(float(ind[m].mean()/(true_ind[m].mean()+1e-9)),2); merr=float((model[m]-V["GT"][m]).abs().mean())
+    print(f"  indirect ratio vs true {ratio} | full model vs GT photo err {merr:.4f}")
     to=lambda t:(t*m[...,None]).detach().cpu().numpy()
     fig,ax=plt.subplots(2,3,figsize=(15,9))
-    ax[0,0].imshow(srgb(to(ind*4)));      ax[0,0].set_title(f"OURS indirect x4 (ratio {ratio})")
+    ax[0,0].imshow(srgb(to(ind*4))); ax[0,0].set_title(f"OURS indirect x4 (ratio {ratio})")
     ax[0,1].imshow(srgb(to(true_ind*4))); ax[0,1].set_title("TRUE indirect x4")
-    ax[0,2].imshow(srgb(to((ind-true_ind).abs()*8))); ax[0,2].set_title("|ours - true| indirect x8")
-    ax[1,0].imshow(srgb(to(model)));      ax[1,0].set_title("OURS full model (direct + bounce)")
-    ax[1,1].imshow(srgb(to(GTgi)));       ax[1,1].set_title("GT photo (full GI)")
-    ax[1,2].imshow(srgb(to((model-GTgi).abs()*3))); ax[1,2].set_title(f"|model - GT| x3 (err {merr:.4f})")
+    ax[0,2].imshow(srgb(to((ind-true_ind).abs()*8))); ax[0,2].set_title("|ours-true| indirect x8")
+    ax[1,0].imshow(srgb(to(model))); ax[1,0].set_title("OURS full model")
+    ax[1,1].imshow(srgb(to(V["GT"]))); ax[1,1].set_title("GT photo (full GI)")
+    ax[1,2].imshow(srgb(to((model-V["GT"]).abs()*3))); ax[1,2].set_title(f"|model-GT| x3 (err {merr:.4f})")
     for a in ax.ravel(): a.axis("off")
-    fig.suptitle("Step 2 COMPARE (soft visibility + near-field area FF): ours vs TRUE", fontsize=12)
-    fig.tight_layout(); fig.savefig(os.path.join(OUT,"step2_compare.png"),dpi=120); plt.close(fig)
-    print("saved -> outputs/rt/step2_compare.png")
+    fig.suptitle(f"Step 2 COMPARE (config {CONFIG}): ours vs TRUE", fontsize=12)
+    fig.tight_layout(); fig.savefig(os.path.join(out_dir(),"step2_compare.png"),dpi=120); plt.close(fig)
+    print(f"saved -> outputs/rt/{CONFIG}/step2_compare.png")
 
 
 def stage_measure():
-    """NO theory -- just measure. Floor near each wall: does our operator gather colored light, and what
-    does the path-traced truth show on the SAME pixels? Print RGB numbers + the wall's gather-weight share."""
     S=build(); tr=tracer(); gsA0=feat_gs(S,S["alb"]); gsN=feat_gs(S,0.5*(S["nrm"]+1)); tr.build_acc(gsA0,rebuild=True)
-    print(f"STEP2 MEASURE | {H}x{W} | GT spp={GT_SPP} | vox={VOX}")
-    n_g=orient(S["nrm"], LIGHT_POS.view(1,3)-S["pos"])
-    lv=LIGHT_POS.view(1,3)-S["pos"]; ld=lv.norm(dim=-1,keepdim=True); l=lv/(ld+1e-9)
-    opg,dg=trace_flat(tr,gsA0,S["pos"]+n_g*EPS,l); visg=(~((opg>0.5)&(dg<ld[:,0]-2*EPS))).float()
-    fac_g=torch.relu((n_g*l).sum(-1))*visg/(ld[:,0].clamp(min=DMIN)**2)
-    eid,E,cen,nor,area=build_elements(S)
-    cntN=torch.zeros(E,device=DEV).index_add_(0,eid,torch.ones(S["N"],device=DEV)).clamp(min=1)
-    mean_fac_elem=torch.zeros(E,device=DEV).index_add_(0,eid,fac_g)/cntN
-    K,Vis,_=build_K(tr,gsA0,eid,E,cen,nor,area,knn=None)
-    smean=lambda x:(torch.zeros(E,x.shape[1],device=DEV).index_add_(0,eid,x))/cntN[:,None]
-    rho_elem=smean(S["alb"]); Edir_elem=LIGHT_INT_TRUE.view(1,3)*mean_fac_elem[:,None]; B0=rho_elem*Edir_elem
-    redw=(nor[:,0]>0.5); greenw=(nor[:,0]<-0.5)                                      # left=red(+x), right=green(-x)
-    pr=lambda v:[round(float(x),3) for x in v]
-    print(f"  B0 RED-wall mean   {pr(B0[redw].mean(0))}")
-    print(f"  B0 GREEN-wall mean {pr(B0[greenw].mean(0))}")
-    cam,pdir=camera(*VIEWS[0]); hit0,p0,n0,alb_t=surf(tr,gsA0,gsN,cam,pdir); n0=orient(n0,-pdir)
-    G=view_G(p0,n0,cen,nor,area); pe=pixel_element(p0,n0,cen,nor); Geff=G*Vis[pe]
-    B=radiosity(rho_elem,Edir_elem,K,BOUNCES)
-    ind_un=alb_t/PI*(G@B).view(H,W,3); ind_g=alb_t/PI*(Geff@B).view(H,W,3)            # indirect RADIANCE (x own albedo, matches TRUE)
-    GTdir=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,0,0)
-    GTgi=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,GT_SPP,GT_NB); true_ind=(GTgi-GTdir).clamp(min=0)
-    floor=(n0[...,1]>0.7)&(hit0>0)
-    Gflat=Geff.view(H,W,E)
-    for name,side in (("near RED wall (left)",p0[...,0]<-0.4),("near GREEN wall (right)",p0[...,0]>0.4)):
+    print(f"STEP2 MEASURE | {H}x{W} GT spp={GT_SPP} | config {CONFIG}")
+    PC=prep(tr,S,gsA0,gsN); V=PC["views"][0]; m=(V["hit"]>0); ap=V["alb_t"]; p0=V["p"]
+    ind=ap/PI*indirect(tr,S,S["alb"],LIGHT_INT_TRUE,PC,V)
+    GTdir=render_gt(tr,S,gsA0,gsN,V["cam"],V["pdir"],LIGHT_POS,LIGHT_INT_TRUE,0,0); true_ind=(V["GT"]-GTdir).clamp(min=0)
+    floor=(V["n"][...,1]>0.7)&m; pr=lambda v:[round(float(x),3) for x in v]
+    for name,side in (("near RED wall",p0[...,0]<-0.4),("near GREEN wall",p0[...,0]>0.4)):
         reg=floor&side
-        if reg.sum()<10: print(f"  {name}: <10 px, skip"); continue
-        ours=ind_g[reg].mean(0); true=true_ind[reg].mean(0)
-        w=Gflat[reg]                                                                  # (npx, E) gather weights
-        wred=w[:,redw].sum(1).mean(); wgreen=w[:,greenw].sum(1).mean(); wtot=w.sum(1).mean().clamp(min=1e-9)
-        print(f"  FLOOR {name}:")
-        print(f"     ours indirect RGB  {pr(ours)}   (R vs G: {float(ours[0]):.3f} / {float(ours[1]):.3f})")
-        print(f"     TRUE indirect RGB  {pr(true)}   (R vs G: {float(true[0]):.3f} / {float(true[1]):.3f})")
-        print(f"     gather-weight share: red-walls {float(wred/wtot):.3f}  green-walls {float(wgreen/wtot):.3f}")
-    print("  (if ours R==G==B but TRUE has R!=G -> our floor gets no color; weight-share shows if walls are under-weighted)")
-    m=(hit0>0); disp=lambda t:(t*m[...,None]).detach().cpu().numpy(); chroma=lambda t:t/(t.amax(-1,keepdim=True)+1e-6)
+        if reg.sum()<10: continue
+        print(f"  FLOOR {name}: ours {pr(ind[reg].mean(0))}  TRUE {pr(true_ind[reg].mean(0))}")
+    to=lambda t:(t*m[...,None]).detach().cpu().numpy(); chroma=lambda t:t/(t.amax(-1,keepdim=True)+1e-6)
     fig,ax=plt.subplots(2,3,figsize=(15,9))
-    ax[0,0].imshow(srgb(disp(ind_g*4)));     ax[0,0].set_title("ours indirect x4 (native)")
-    ax[0,1].imshow(srgb(disp(true_ind*4)));  ax[0,1].set_title("TRUE indirect x4 (native)")
-    ax[0,2].imshow(srgb(disp(ind_g*4/3)));   ax[0,2].set_title("ours indirect /3 x4 (magnitude-matched)")
-    ax[1,0].imshow(disp(chroma(ind_g)));     ax[1,0].set_title("ours CHROMATICITY (hue only)")
-    ax[1,1].imshow(disp(chroma(true_ind)));  ax[1,1].set_title("TRUE chromaticity (hue only)")
+    ax[0,0].imshow(srgb(to(ind*4))); ax[0,0].set_title("ours indirect x4")
+    ax[0,1].imshow(srgb(to(true_ind*4))); ax[0,1].set_title("TRUE indirect x4")
+    ax[0,2].imshow(srgb(to(ind*4/max(float(ind[m].mean()/(true_ind[m].mean()+1e-9)),1e-3)))); ax[0,2].set_title("ours magnitude-matched x4")
+    ax[1,0].imshow(to(chroma(ind))); ax[1,0].set_title("ours chromaticity")
+    ax[1,1].imshow(to(chroma(true_ind))); ax[1,1].set_title("TRUE chromaticity")
     ax[1,2].axis("off")
     for a in [ax[0,0],ax[0,1],ax[0,2],ax[1,0],ax[1,1]]: a.axis("off")
-    fig.suptitle("Step 2 MEASURE: ours vs TRUE indirect -- native, magnitude-matched (/3), and hue-only", fontsize=12)
-    fig.tight_layout(); fig.savefig(os.path.join(OUT,"step2_measure.png"),dpi=110); plt.close(fig)
-    print("saved -> outputs/rt/step2_measure.png")
+    fig.suptitle(f"Step 2 MEASURE (config {CONFIG})", fontsize=12)
+    fig.tight_layout(); fig.savefig(os.path.join(out_dir(),"step2_measure.png"),dpi=110); plt.close(fig)
+    print(f"saved -> outputs/rt/{CONFIG}/step2_measure.png")
+
+
+def stage_full():
+    S=build(); tr=tracer(); gsA0=feat_gs(S,S["alb"]); gsN=feat_gs(S,0.5*(S["nrm"]+1)); tr.build_acc(gsA0,rebuild=True)
+    print(f"STEP2 FULL A/B | {H}x{W} iters={ITERS} | config {CONFIG} | indirect OFF vs ON")
+    PC=prep(tr,S,gsA0,gsN); V0=PC["views"][0]; true=V0["alb_t"]
+    def optimize(gi_on,tag):
+        alb_raw=torch.nn.Parameter(torch.zeros(S["N"],3,device=DEV)); lint=torch.nn.Parameter(LIGHT_INT_TRUE.clone())
+        opt=torch.optim.Adam([{"params":[alb_raw],"lr":0.05},{"params":[lint],"lr":0.2}])
+        for it in range(ITERS):
+            rho=torch.sigmoid(alb_raw); gsA=feat_gs(S,rho); I=lint.clamp(min=0.05); loss=0.0
+            for V in PC["views"]:
+                ap,_,_=trace(tr,gsA,V["cam"],V["pdir"]); model=ap/PI*V["fac"]*I.view(1,1,3)
+                if gi_on: model=model+ap/PI*indirect(tr,S,rho,I,PC,V)
+                loss=loss+((model-V["GT"]).abs()*(V["hit"][...,None])).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        with torch.no_grad():
+            rho=torch.sigmoid(alb_raw); rec,_,_=trace(tr,feat_gs(S,rho),V0["cam"],V0["pdir"]); I=lint.clamp(min=0.05)
+        return rec.detach(),[round(float(x),2) for x in I]
+    recOFF,liOFF=optimize(False,"noGI"); recON,liON=optimize(True,"GI")
+    with torch.no_grad():
+        seg=torch.zeros(S["N"],3,device=DEV); seg[S["seg"]["sp"]]=1.0
+        spix,_,_=trace(tr,feat_gs(S,seg),V0["cam"],V0["pdir"]); sph=(spix[...,0]>0.5)&(V0["hit"]>0); hm=V0["hit"][...,None]
+        f=lambda rec:([round(float(x),2) for x in rec[sph].mean(0)], float(((rec-true).abs()*hm).sum()/(hm.sum()*3)))
+        mOFF,eOFF=f(recOFF); mON,eON=f(recON)
+    print(f"  indirect OFF: sphere {mOFF} err {eOFF:.4f} light {liOFF}")
+    print(f"  indirect ON : sphere {mON} err {eON:.4f} light {liON}  (true sphere [0.7], light [7,7,7])")
+    to=lambda t:(t*(V0["hit"][...,None])).detach().cpu().numpy()
+    fig,ax=plt.subplots(1,3,figsize=(15,5))
+    ax[0].imshow(srgb(to(true))); ax[0].set_title("TRUE albedo")
+    ax[1].imshow(srgb(to(recOFF))); ax[1].set_title(f"recovered: NO indirect (sphere {mOFF}, light {[round(x) for x in liOFF]})")
+    ax[2].imshow(srgb(to(recON))); ax[2].set_title(f"recovered: + bounce (sphere {mON}, light {[round(x) for x in liON]})")
+    for a in ax: a.axis("off")
+    fig.suptitle(f"Step 2 A/B (config {CONFIG}): does the bounce kill the albedo<->light drift?", fontsize=12)
+    fig.tight_layout(); fig.savefig(os.path.join(out_dir(),"step2_ab.png"),dpi=110); plt.close(fig)
+    print(f"saved -> outputs/rt/{CONFIG}/step2_ab.png")
 
 
 if __name__=="__main__":
-    if MODE=="sanity": stage_sanity()
-    elif MODE=="full": stage_full()
-    elif MODE=="walk": stage_walk()
-    elif MODE=="bounces": stage_bounces()
-    elif MODE=="debug": stage_debug()
+    if MODE=="compare": stage_compare()
     elif MODE=="measure": stage_measure()
-    elif MODE=="compare": stage_compare()
-    else: print("unknown mode")
+    elif MODE=="full": stage_full()
+    else: print("unknown mode (use: compare | measure | full)")
