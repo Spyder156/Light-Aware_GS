@@ -26,7 +26,7 @@ H = int(sys.argv[2]) if len(sys.argv)>2 else 128
 ITERS = int(sys.argv[3]) if len(sys.argv)>3 else 400
 GT_SPP = int(sys.argv[4]) if len(sys.argv)>4 else 256
 W=H; EPS=0.04; DMIN=0.6; GT_NB=3
-VOX=0.12; R_MAX=3.0; KNN=96; BOUNCES=2          # element clustering, form-factor neighborhood, indirect bounces
+VOX=0.18; R_MAX=3.0; KNN=96; BOUNCES=2          # element clustering, form-factor neighborhood, indirect bounces
 
 LIGHT_POS = torch.tensor([0.0,0.9,-0.1], device=DEV)
 LIGHT_INT_TRUE = torch.tensor([7.0,7.0,7.0], device=DEV)
@@ -157,6 +157,29 @@ def pixel_element(p, n, cen, nor, chunk=20000):
     return out
 
 
+def pixel_weights(p, n, cen, nor, k=8, chunk=16000):
+    """per-pixel soft weights to its k nearest normal-compatible patches (for smooth visibility blend)."""
+    HW=p.shape[0]*p.shape[1]; pf=p.reshape(-1,3); nf=n.reshape(-1,3)
+    nbr=torch.zeros(HW,k,dtype=torch.long,device=DEV); w=torch.zeros(HW,k,device=DEV)
+    for s in range(0,HW,chunk):
+        d=(pf[s:s+chunk][:,None,:]-cen[None,:,:]).norm(dim=-1)
+        d=torch.where((nf[s:s+chunk]@nor.T)>0.5, d, torch.full_like(d,1e9))
+        vals,idx=d.topk(k,dim=1,largest=False)
+        ww=torch.exp(-(vals**2)/(2*VOX**2)); ww=ww/ww.sum(-1,keepdim=True).clamp(min=1e-9)
+        nbr[s:s+chunk]=idx; w[s:s+chunk]=ww
+    return nbr,w
+
+
+def gated_G(G, Vis, nbr, w, chunk=2048):
+    """bake SOFT per-pixel visibility into G: each pixel blends its k-nearest patches' visibility rows,
+    so the shadow boundary is smooth (no patch-step squares). Geometry-only -> precomputed once per view."""
+    HW=G.shape[0]; out=torch.empty_like(G)
+    for s in range(0,HW,chunk):
+        vs=(w[s:s+chunk][:,:,None]*Vis[nbr[s:s+chunk]]).sum(1)                       # (c,E) soft visibility
+        out[s:s+chunk]=G[s:s+chunk]*vs
+    return out
+
+
 def smooth_weights(S, cen, nor, k=8, chunk=20000):
     """per-Gaussian interpolation weights from its k nearest (normal-compatible) element centroids ->
     reconstructs a SMOOTH indirect field from the coarse element values (kills the blocky squares)."""
@@ -181,7 +204,7 @@ def view_G(p, n, cen, nor, area, chunk=4096):
     G=torch.zeros(HW,E,device=DEV)
     for s in range(0,HW,chunk):
         pc=pf[s:s+chunk]; nc=nf[s:s+chunk]
-        d=cen[None,:,:]-pc[:,None,:]; r=d.norm(dim=-1).clamp(min=1e-3); u=d/r[...,None]
+        d=cen[None,:,:]-pc[:,None,:]; r=d.norm(dim=-1).clamp(min=0.06); u=d/r[...,None]   # near-field clamp -> fewer edge waves
         cos_i=torch.relu((nc[:,None,:]*u).sum(-1)); cos_j=torch.relu((-nor[None,:,:]*u).sum(-1))
         G[s:s+chunk]=cos_i*cos_j*area[None,:]/(PI*r**2 + area[None,:])              # area form factor (near-field stable)
     return G                                                                          # (HW, E)
@@ -218,8 +241,8 @@ def precompute(tr,S,gsA0,gsN):
         fac_pix=torch.relu((n0*lp_).sum(-1,keepdim=True))*vis0/(ldp.clamp(min=DMIN)**2)
         GTgi=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,GT_SPP,GT_NB).detach()
         GTdir=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,0,0).detach()
-        G=view_G(p0,n0,cen,nor,area); pe=pixel_element(p0,n0,cen,nor)
-        views.append(dict(cam=cam,pdir=pdir,hit=hit0,p=p0,n=n0,alb_t=alb_t,fac=fac_pix,GTgi=GTgi,GTdir=GTdir,G=G,pe=pe))
+        Graw=view_G(p0,n0,cen,nor,area); pnbr,pw=pixel_weights(p0,n0,cen,nor); G=gated_G(Graw,Vis,pnbr,pw)
+        views.append(dict(cam=cam,pdir=pdir,hit=hit0,p=p0,n=n0,alb_t=alb_t,fac=fac_pix,GTgi=GTgi,GTdir=GTdir,G=G))
     return dict(fac_g=fac_g,eid=eid,E=E,K=K,V=Vis,Kdens=dens,mean_fac_elem=mean_fac_elem,views=views,
                 cen=cen,nor=nor,area=area)
 
@@ -231,8 +254,7 @@ def indirect_pix(tr, S, rho_g, lint, PC, view):
     rho_elem=scatter_mean(rho_g,eid,E)
     Edir_elem=lint.view(1,3)*PC["mean_fac_elem"][:,None]
     B=radiosity(rho_elem,Edir_elem,K,BOUNCES)                          # (E,3) multi-bounce element radiosity
-    Geff=view["G"]*PC["V"][view["pe"]]                                 # gate gather by patch-patch visibility
-    return (Geff@B).view(H,W,3)                                        # (H,W,3) per-pixel, no render needed
+    return (view["G"]@B).view(H,W,3)                                   # G is already soft-visibility-gated; per-pixel
 
 
 def render_model(tr,S,gsA,rho_g,lint,PC,view,use_gi):
@@ -430,6 +452,45 @@ def stage_debug():
     print("saved -> outputs/rt/step2_debug.png")
 
 
+def stage_compare():
+    """high-quality clean comparison with both fixes (soft visibility + near-field-stable coarser patches)."""
+    S=build(); tr=tracer(); gsA0=feat_gs(S,S["alb"]); gsN=feat_gs(S,0.5*(S["nrm"]+1)); tr.build_acc(gsA0,rebuild=True)
+    print(f"STEP2 COMPARE | {H}x{W} | GT spp={GT_SPP} nb={GT_NB} | vox={VOX} bounces={BOUNCES}")
+    n_g=orient(S["nrm"], LIGHT_POS.view(1,3)-S["pos"])
+    lv=LIGHT_POS.view(1,3)-S["pos"]; ld=lv.norm(dim=-1,keepdim=True); l=lv/(ld+1e-9)
+    opg,dg=trace_flat(tr,gsA0,S["pos"]+n_g*EPS,l); visg=(~((opg>0.5)&(dg<ld[:,0]-2*EPS))).float()
+    fac_g=torch.relu((n_g*l).sum(-1))*visg/(ld[:,0].clamp(min=DMIN)**2)
+    eid,E,cen,nor,area=build_elements(S)
+    cntN=torch.zeros(E,device=DEV).index_add_(0,eid,torch.ones(S["N"],device=DEV)).clamp(min=1)
+    mean_fac_elem=torch.zeros(E,device=DEV).index_add_(0,eid,fac_g)/cntN
+    K,Vis,_=build_K(tr,gsA0,eid,E,cen,nor,area,knn=None)
+    smean=lambda x:(torch.zeros(E,x.shape[1],device=DEV).index_add_(0,eid,x))/cntN[:,None]
+    rho_elem=smean(S["alb"]); Edir_elem=LIGHT_INT_TRUE.view(1,3)*mean_fac_elem[:,None]
+    cam,pdir=camera(*VIEWS[0]); hit0,p0,n0,alb_t=surf(tr,gsA0,gsN,cam,pdir); n0=orient(n0,-pdir); m=(hit0>0)
+    Graw=view_G(p0,n0,cen,nor,area); pnbr,pw=pixel_weights(p0,n0,cen,nor); G=gated_G(Graw,Vis,pnbr,pw)
+    print(f"  E={E}; rendering high-q GT ...")
+    B=radiosity(rho_elem,Edir_elem,K,BOUNCES); ind=alb_t/PI*(G@B).view(H,W,3)
+    lvp=LIGHT_POS.view(1,1,3)-p0; ldp=lvp.norm(dim=-1,keepdim=True); lpp=lvp/(ldp+1e-9); vis0=shadow_vis(tr,gsA0,p0,n0,LIGHT_POS)
+    direct=alb_t/PI*torch.relu((n0*lpp).sum(-1,keepdim=True))*vis0*LIGHT_INT_TRUE.view(1,1,3)/(ldp.clamp(min=DMIN)**2)
+    model=direct+ind
+    GTgi=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,GT_SPP,GT_NB)
+    GTdir=render_gt(tr,S,gsA0,gsN,cam,pdir,LIGHT_POS,LIGHT_INT_TRUE,0,0); true_ind=(GTgi-GTdir).clamp(min=0)
+    merr=float((model[m]-GTgi[m]).abs().mean()); ratio=round(float(ind[m].mean()/(true_ind[m].mean()+1e-9)),2)
+    print(f"  indirect mean ratio vs true {ratio} | full model vs GT photo mean abs err {merr:.4f}")
+    to=lambda t:(t*m[...,None]).detach().cpu().numpy()
+    fig,ax=plt.subplots(2,3,figsize=(15,9))
+    ax[0,0].imshow(srgb(to(ind*4)));      ax[0,0].set_title(f"OURS indirect x4 (ratio {ratio})")
+    ax[0,1].imshow(srgb(to(true_ind*4))); ax[0,1].set_title("TRUE indirect x4")
+    ax[0,2].imshow(srgb(to((ind-true_ind).abs()*8))); ax[0,2].set_title("|ours - true| indirect x8")
+    ax[1,0].imshow(srgb(to(model)));      ax[1,0].set_title("OURS full model (direct + bounce)")
+    ax[1,1].imshow(srgb(to(GTgi)));       ax[1,1].set_title("GT photo (full GI)")
+    ax[1,2].imshow(srgb(to((model-GTgi).abs()*3))); ax[1,2].set_title(f"|model - GT| x3 (err {merr:.4f})")
+    for a in ax.ravel(): a.axis("off")
+    fig.suptitle("Step 2 COMPARE (soft visibility + near-field area FF): ours vs TRUE", fontsize=12)
+    fig.tight_layout(); fig.savefig(os.path.join(OUT,"step2_compare.png"),dpi=120); plt.close(fig)
+    print("saved -> outputs/rt/step2_compare.png")
+
+
 def stage_measure():
     """NO theory -- just measure. Floor near each wall: does our operator gather colored light, and what
     does the path-traced truth show on the SAME pixels? Print RGB numbers + the wall's gather-weight share."""
@@ -489,4 +550,5 @@ if __name__=="__main__":
     elif MODE=="bounces": stage_bounces()
     elif MODE=="debug": stage_debug()
     elif MODE=="measure": stage_measure()
+    elif MODE=="compare": stage_compare()
     else: print("unknown mode")
