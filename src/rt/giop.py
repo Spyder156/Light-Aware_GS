@@ -13,7 +13,7 @@ from rt_cornell import GS  # noqa: re-exported for convenience
 DEV="cuda"; PI=math.pi; EPS=0.04; DMIN=0.6
 
 # ---------------- operator config (TUNE HERE -- both step2 and step3 use it) ----------------
-VOX=0.12; R_MAX=3.0; BOUNCES=3                   # finer patches (detail for sphere-bleed/contact), bounces=GT_NB (no over-energy)
+VOX=0.18; R_MAX=3.0; BOUNCES=3                   # default: coarser is same accuracy as vox0.12, fewer patches (cheaper)
 CONFIG=f"vox{VOX}_b{BOUNCES}"
 
 _OUT_BASE=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "outputs", "rt")

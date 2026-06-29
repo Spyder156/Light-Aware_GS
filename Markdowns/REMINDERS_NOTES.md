@@ -32,6 +32,14 @@ Root: a **coarse-patch operator matches true GI's *magnitude* but not its exact 
 - ultimately, **differentiable path-traced GI in the loop** for exactness (expensive — the thing we avoided),
   or a learned residual on top of the form-factor operator.
 
+**Tried & ruled out (2026-06):** finer patches `vox0.12_b3` (bounces matched to GT=3, magnitude controlled
+ratio ~1.1×). The *indirect proxy* (step2_compare) looks cleaner/less-blocky, **but the recovered-albedo
+error is UNCHANGED** (specON_GION: 0.0796 → 0.0798) and residuals 1 & 2 persist visually. So **patch
+resolution is NOT the lever** — it's a genuine **fidelity ceiling (~0.080 albedo err)** of the coarse
+form-factor approach, a *spatial-distribution* error (curved sphere + occluded contact), not a tuning miss.
+The real fix is **differentiable path-traced GI in the loop** (deferred). Default config reverted to the
+cheaper `vox0.18_b3` (same accuracy, fewer patches).
+
 **Why parked:** the Step-2 science point is already made (below); chasing pixel-exact GI via the coarse
 operator is diminishing returns for now.
 
