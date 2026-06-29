@@ -55,3 +55,30 @@ direct-only model suffers (Step 1):
 
 This is the prof's **ρ² mechanism** (direct scales as albedo¹, indirect as albedo²; only the true scale makes
 both agree). **Perfect** recovery is currently bounded by the GI-operator fidelity gap noted above.
+
+---
+
+## Shadow treatment on real data (Phase 3) — parked for a future discussion
+
+Ref figure: `outputs/rt/dmv_bear/stageB_albedo_ab.png` (bottom row: a self-shadowing light, exact-RT shadow
+vs shadow-map). Current real-data forward model = `albedo · max(n·l,0) · visibility`, **direct only, binary
+shadow** (visibility ∈ {0,1}).
+
+- **Binary visibility is correct for the *direct* term of a single distant light** — that light is either
+  blocked or not, so a hard shadow edge is physically right (DiLiGenT lights are ~point/distant, so edges
+  really are sharp; the missing thing is **fill, not penumbra**).
+- **But real shadows aren't pitch-black** — they're filled by **indirect (bounced) light**. Our direct-only
+  model drops shadowed pixels to ~0 → too dark vs the real photos → the recovered **albedo over-brightens in
+  the crevices** to compensate (the faint error in the diff map). User flagged this: "a shadow is never
+  binary, light reaches by bounces — it should be shaded."
+
+**Higher-level shadow options to revisit (add complexity later):**
+- **(a) leave as-is** — direct + binary exact shadow; the prior raster pipeline did the same; small error on a
+  mostly-convex object like bear.
+- **(b) add the precomputed GI bounce** for physical fill (the operator parked above; low payoff on convex
+  objects, matters for strongly concave ones).
+- **(c) cheap ambient / per-Gaussian AO fill** so shadows aren't black, without full GI (what the raster side
+  used) — pragmatic, near-zero cost, directly addresses the "shadows should be shaded" point.
+
+Decide when an object with strong concavities (e.g. `reading`) actually needs it. For now: recovered albedo
+looks good; keep the binary exact-shadow model and move on.
