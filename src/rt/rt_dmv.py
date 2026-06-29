@@ -20,8 +20,10 @@ from giop import DEV, trace, orient, srgb
 
 VIEW=int(sys.argv[1]) if len(sys.argv)>1 else 1
 STAGE=sys.argv[2] if len(sys.argv)>2 else "a"
-ROOT=os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","..","data","diligent_mv","mvpmsData","bearPNG")
-OUT=os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","..","outputs","rt","dmv_bear"); os.makedirs(OUT,exist_ok=True)
+SCENE=sys.argv[3] if len(sys.argv)>3 else "bearPNG"
+TAG=SCENE.replace("PNG","").lower()
+ROOT=os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","..","data","diligent_mv","mvpmsData",SCENE)
+OUT=os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","..","outputs","rt",f"dmv_{TAG}"); os.makedirs(OUT,exist_ok=True)
 H,W=512,612; FLIP=torch.tensor([1.,-1.,-1.],device=DEV); N_GAUSS=150000; NV=20
 
 
