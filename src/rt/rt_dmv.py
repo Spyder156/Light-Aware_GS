@@ -239,6 +239,76 @@ def stage_c(S,tr,gsA0,gsN,K,cams,EPS,center,radius):
     print("saved -> outputs/rt/dmv_bear/stageC_relight.png")
 
 
+def psnr(a,b,m):
+    mse=float(((a-b)**2*m).sum()/(m.sum()*3+1e-8)); return -10*math.log10(mse+1e-10)
+
+def stage_d(S,tr,gsA0,gsN,K,cams,EPS,center,radius):
+    """Phase 4 WEDGE: bear under variable per-frame lighting (1 view, many lights), lights UNKNOWN.
+    BAKED model (one fixed color, no light) collapses; LIGHT-AWARE RT (shared albedo + per-frame light
+    direction recovered from scratch + exact shadow) fits + relights. + detected-light angular error."""
+    V=1; FRAMES=list(range(1,61,2)); HELD=[l for l in range(1,61) if l not in FRAMES][:10]
+    G=view_gbuffer(tr,gsA0,gsN,K,cams,V); m=G["mask"]; mh=m[...,None].float(); n0=G["n0"]; p0=G["p0"]; cam,pdir=G["cam"],G["pdir"]
+    ltrue=torch.nn.functional.normalize(G["ldw"],dim=-1)                              # true dirs (eval only, NOT given to model)
+    imgs=[(load_img(V,L,G["li"])*mh).detach() for L in FRAMES]; F=len(FRAMES)
+    cc=-cams[V-1][0].T@cams[V-1][1]; toC=torch.nn.functional.normalize(cc-center,dim=0)
+    print(f"STAGE D wedge | view {V} | {F} variable-light frames (lights UNKNOWN) | held-out {len(HELD)}")
+
+    # ---- BAKED baseline: one per-Gaussian color, no light model ----
+    c_raw=torch.nn.Parameter(torch.zeros(S["N"],3,device=DEV)); opt=torch.optim.Adam([c_raw],lr=0.05)
+    for it in range(150):
+        ap,_,_=trace(tr,build_gs(S,torch.sigmoid(c_raw)),cam,pdir)
+        loss=sum(((ap*mh-im).abs()).mean() for im in imgs)/F
+        opt.zero_grad(); loss.backward(); opt.step()
+    with torch.no_grad(): baked,_,_=trace(tr,build_gs(S,torch.sigmoid(c_raw)),cam,pdir); baked=baked*mh
+    pBAKED=sum(psnr(baked,im,mh) for im in imgs)/F
+
+    # ---- LIGHT-AWARE RT: shared albedo + per-frame UNKNOWN light dir + exact shadow ----
+    torch.manual_seed(0)
+    alb_raw=torch.nn.Parameter(torch.zeros(S["N"],3,device=DEV))
+    l_raw=torch.nn.Parameter(toC.view(1,3).repeat(F,1)+0.25*torch.randn(F,3,device=DEV))   # init ~toward camera
+    opt=torch.optim.Adam([{"params":[alb_raw],"lr":0.05},{"params":[l_raw],"lr":0.02}])
+    vis=[None]*F
+    for it in range(320):
+        lf=torch.nn.functional.normalize(l_raw,dim=-1)
+        if it%20==0:                                                                 # refresh exact shadows for current light estimate
+            with torch.no_grad():
+                for f in range(F): vis[f]=shadow_vis_dir(tr,gsA0,p0,n0,lf[f],EPS)
+        alb=torch.sigmoid(alb_raw); ap,_,_=trace(tr,build_gs(S,alb),cam,pdir); loss=0.0
+        for f in range(F):
+            ndl=torch.relu((n0*lf[f].view(1,1,3)).sum(-1,keepdim=True))
+            loss=loss+((ap*ndl*vis[f]-imgs[f])*mh).abs().mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+        if it%80==0: print(f"  [LA] it {it} loss {float(loss/F):.4f}")
+    with torch.no_grad():
+        alb=torch.sigmoid(alb_raw); apLA,_,_=trace(tr,build_gs(S,alb),cam,pdir); lf=torch.nn.functional.normalize(l_raw,dim=-1)
+        laR=[];
+        for f in range(F):
+            ndl=torch.relu((n0*lf[f].view(1,1,3)).sum(-1,keepdim=True)); laR.append((apLA*ndl*vis[f]*mh))
+        pLA=sum(psnr(laR[f],imgs[f],mh) for f in range(F))/F
+        # detected-light angular error vs true
+        ang=[math.degrees(math.acos(float((lf[f]*ltrue[FRAMES[f]-1]).sum().clamp(-1,1)))) for f in range(F)]
+        ang_err=sum(ang)/F
+        # relight held-out (light-aware: known held-out dir; baked: its fixed appearance)
+        relLA=[]; relBK=[]
+        for L in HELD:
+            l=ltrue[L-1]; vh=shadow_vis_dir(tr,gsA0,p0,n0,l,EPS); ndl=torch.relu((n0*l.view(1,1,3)).sum(-1,keepdim=True))
+            real=load_img(V,L,G["li"])*mh; relLA.append(psnr(apLA*ndl*vh*mh,real,mh)); relBK.append(psnr(baked,real,mh))
+        rLA=sum(relLA)/len(HELD); rBK=sum(relBK)/len(HELD)
+    print(f"WEDGE | per-frame FIT PSNR: baked {pBAKED:.2f} dB vs light-aware {pLA:.2f} dB  (+{pLA-pBAKED:.1f})")
+    print(f"  detected-light mean angular err {ang_err:.1f} deg (recovered from scratch)")
+    print(f"  HELD-OUT RELIGHT PSNR: baked {rBK:.2f} dB vs light-aware {rLA:.2f} dB  (+{rLA-rBK:.1f})")
+    to=lambda t:(t).detach().cpu().numpy()
+    fig,ax=plt.subplots(2,3,figsize=(14,9))
+    for r,f in enumerate([0,F//2]):
+        ax[r,0].imshow(srgb(np.clip(to(imgs[f]),0,None))); ax[r,0].set_title(f"REAL frame {f} (its own light)")
+        ax[r,1].imshow(srgb(np.clip(to(baked),0,None)));   ax[r,1].set_title(f"BAKED (one fixed color)")
+        ax[r,2].imshow(srgb(np.clip(to(laR[f]),0,None)));  ax[r,2].set_title("LIGHT-AWARE RT (per-frame light)")
+        for a in ax[r]: a.axis("off")
+    fig.suptitle(f"Phase 4 wedge -- variable lighting (unknown): baked {pBAKED:.1f} dB vs light-aware {pLA:.1f} dB | relight +{rLA-rBK:.1f} dB",fontsize=12)
+    fig.tight_layout(); fig.savefig(os.path.join(OUT,"stageD_wedge.png"),dpi=110); plt.close(fig)
+    print("saved -> outputs/rt/dmv_bear/stageD_wedge.png")
+
+
 def main():
     pts,nrm,scale=sample_mesh(os.path.join(ROOT,"mesh_Gt.ply"),N_GAUSS)
     print(f"[bear] {pts.shape[0]} gaussians on mesh | spacing {scale:.2f} mm")
@@ -252,6 +322,7 @@ def main():
     if STAGE=="a": stage_a(S,tr,gsA0,gsN,K,cams,EPS)
     elif STAGE=="b": stage_b(S,tr,gsA0,gsN,K,cams,EPS,center,radius)
     elif STAGE=="c": stage_c(S,tr,gsA0,gsN,K,cams,EPS,center,radius)
+    elif STAGE=="d": stage_d(S,tr,gsA0,gsN,K,cams,EPS,center,radius)
     else: print("unknown stage")
 
 
