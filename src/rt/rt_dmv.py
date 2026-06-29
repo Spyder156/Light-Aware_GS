@@ -1,0 +1,196 @@
+"""PHASE 3 -- DiLiGenT-MV (bear) on the RT backbone. Real geometry seeded as Gaussians (mesh_Gt.ply),
+calibrated OpenCV cameras, real per-view directional OLAT lights. Forward model: diffuse Lambert albedo
+shaded with EXACT ray-traced self-shadows (shadow ray toward the distant light). Headline (later stages):
+recover material with exact-RT visibility vs a shadow-map, + relight -- raster-vs-RT on real data.
+
+Conventions matched from the gsplat pipeline (dmv_gs3d): world = mesh frame (mm); x_cam = Rc x + Tc (OpenCV);
+raw light dir -> cam via FLIP=[1,-1,-1] -> world via R^T; 16-bit linear images / 65535 / per-light intensity;
+diffuse reflectance model = albedo * max(n.l,0) * visibility (intensity divided out of the image).
+
+Stage A (this run): forward sanity -- render bear (grey albedo, exact shadows) under a few lights/view and
+compare to the real photos (shading + cast/self-shadows should line up). Run in `fullcircle`.
+Usage: rt_dmv.py [view] [stage]"""
+import sys, os, math
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import torch, numpy as np, cv2, scipy.io as sio
+from plyfile import PlyData
+import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+from rt_cornell import GS, tracer, quat_from_normal
+from giop import DEV, trace, orient, srgb
+
+VIEW=int(sys.argv[1]) if len(sys.argv)>1 else 1
+STAGE=sys.argv[2] if len(sys.argv)>2 else "a"
+ROOT=os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","..","data","diligent_mv","mvpmsData","bearPNG")
+OUT=os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","..","outputs","rt","dmv_bear"); os.makedirs(OUT,exist_ok=True)
+H,W=512,612; FLIP=torch.tensor([1.,-1.,-1.],device=DEV); N_GAUSS=150000; NV=20
+
+
+def sample_mesh(path,N):
+    """sample N surface points + face normals from a .ply (area-weighted), no trimesh."""
+    ply=PlyData.read(path); v=ply["vertex"]; V=np.stack([v["x"],v["y"],v["z"]],-1).astype(np.float32)
+    F=np.stack(ply["face"]["vertex_indices"]).astype(np.int64)                       # (Nf,3)
+    tri=V[F]                                                                          # (Nf,3,3)
+    e1=tri[:,1]-tri[:,0]; e2=tri[:,2]-tri[:,0]; cn=np.cross(e1,e2); area=0.5*np.linalg.norm(cn,axis=1)
+    fn=cn/(np.linalg.norm(cn,axis=1,keepdims=True)+1e-12)
+    rng=np.random.RandomState(0); fi=rng.choice(len(F),size=N,p=area/area.sum())
+    u=rng.rand(N,1).astype(np.float32); w=rng.rand(N,1).astype(np.float32); m=(u+w>1); u[m]=1-u[m]; w[m]=1-w[m]
+    pts=(tri[fi,0]+u*(tri[fi,1]-tri[fi,0])+w*(tri[fi,2]-tri[fi,0])).astype(np.float32)
+    scale=float(math.sqrt(area.sum()/N))
+    return (torch.tensor(pts,device=DEV), torch.nn.functional.normalize(torch.tensor(fn[fi].astype(np.float32),device=DEV),dim=-1), scale)
+
+
+def calib():
+    c=sio.loadmat(os.path.join(ROOT,"Calib_Results.mat")); K=torch.tensor(c["KK"].astype(np.float32),device=DEV)
+    cams=[]
+    for v in range(1,NV+1):
+        R=torch.tensor(c[f"Rc_{v}"].astype(np.float32),device=DEV); T=torch.tensor(c[f"Tc_{v}"].astype(np.float32),device=DEV).reshape(3)
+        cams.append((R,T))
+    return K,cams
+
+
+def load_view_lights(v,R):
+    ld=np.genfromtxt(os.path.join(ROOT,f"view_{v:02d}","light_directions.txt")).astype(np.float32)
+    ld=torch.tensor(ld,device=DEV)*FLIP[None]                                        # raw -> cam (OpenCV)
+    ldw=torch.einsum("ji,kj->ki",R,ld)                                               # cam -> world (R^T l)
+    li=torch.tensor(np.genfromtxt(os.path.join(ROOT,f"view_{v:02d}","light_intensities.txt")).astype(np.float32),device=DEV)
+    mask=torch.tensor(cv2.imread(os.path.join(ROOT,f"view_{v:02d}","mask.png"),0),device=DEV)>127
+    return torch.nn.functional.normalize(ldw,dim=-1), li, mask
+
+
+def load_img(v,L,li):
+    im=cv2.imread(os.path.join(ROOT,f"view_{v:02d}",f"{L:03d}.png"),cv2.IMREAD_UNCHANGED)
+    im=cv2.cvtColor(im,cv2.COLOR_BGR2RGB).astype(np.float32)/65535.0
+    im=im/(li[L-1].cpu().numpy()[None,None,:]+1e-8)
+    return torch.tensor(im,device=DEV)
+
+
+def cam_rays(K,R,T):
+    """per-pixel world-frame rays for an OpenCV camera. ray_ori = cam center, ray_dir in world."""
+    cc=(-R.T@T)                                                                      # camera center (world)
+    fx,fy,cx,cy=K[0,0],K[1,1],K[0,2],K[1,2]
+    ys,xs=torch.meshgrid(torch.arange(H,device=DEV),torch.arange(W,device=DEV),indexing="ij")
+    dcam=torch.stack([(xs+0.5-cx)/fx,(ys+0.5-cy)/fy,torch.ones_like(xs)],-1).float() # OpenCV: +z fwd,+x right,+y down
+    dworld=torch.einsum("ji,hwj->hwi",R,torch.nn.functional.normalize(dcam,dim=-1))  # cam->world (R^T)
+    return cc.view(1,1,3).expand(H,W,3).contiguous(), torch.nn.functional.normalize(dworld,dim=-1)
+
+
+def build_gs(S,color):
+    return GS(S["pos"],S["quat"],S["sc"],S["dens"],color)
+
+
+def shadow_vis_dir(tr,gsA,p,n,lworld,eps):
+    """exact shadow for a DISTANT light: ray from p+n*eps toward the light direction; occluded if it hits."""
+    d=lworld.view(1,1,3).expand_as(p)
+    _,sop,_=trace(tr,gsA,p+n*eps,d)
+    return (sop<=0.5).float()[...,None]
+
+
+def vis_sm_dir(tr,gsA,p,l,center,radius,SR=384):
+    """RASTER-style shadow-map for a DISTANT light (the baseline vs exact RT shadows): render depth from a
+    far light-cam along the light dir, project surface points, compare (the acne/bias/aliasing baseline)."""
+    l=torch.nn.functional.normalize(l,dim=0); D=radius*4.0; origin=center+l*D; fwd=-l
+    up0=torch.tensor([0.,1,0.],device=DEV) if abs(float(fwd[1]))<0.95 else torch.tensor([1.,0,0.],device=DEV)
+    right=torch.nn.functional.normalize(torch.linalg.cross(up0,fwd),dim=0); up=torch.linalg.cross(fwd,right)
+    fov=2*math.atan(float(radius)*1.4/D); fl=0.5*SR/math.tan(0.5*fov)
+    ys,xs=torch.meshgrid(torch.arange(SR,device=DEV),torch.arange(SR,device=DEV),indexing="ij")
+    dirs=torch.nn.functional.normalize((xs-SR/2+0.5)[...,None]/fl*right+(-(ys-SR/2+0.5))[...,None]/fl*up+fwd,dim=-1)
+    _,_,depth=trace(tr,gsA,origin.view(1,1,3).expand(SR,SR,3).contiguous(),dirs)
+    rel=p-origin.view(1,1,3); x=(rel*right).sum(-1); y=(rel*up).sum(-1); z=(rel*fwd).sum(-1).clamp(min=1e-4)
+    gx=(fl*x/z+SR/2)/SR*2-1; gy=(-fl*y/z+SR/2)/SR*2-1
+    samp=torch.nn.functional.grid_sample(depth[None,None],torch.stack([gx,gy],-1)[None],mode="bilinear",align_corners=False)[0,0]
+    pdist=rel.norm(dim=-1); bias=float(radius)*0.02
+    lit=(pdist<=samp+bias)|(samp<1e-3); oob=(gx.abs()>1)|(gy.abs()>1)
+    return torch.where(oob,torch.ones_like(lit.float()),lit.float())[...,None]
+
+
+def view_gbuffer(tr,gsA0,gsN,K,cams,v):
+    R,T=cams[v-1]; cam,pdir=cam_rays(K,R,T)
+    _,op,dist=trace(tr,gsA0,cam,pdir); hit=(op>0.5); p0=cam+dist[...,None]*pdir
+    nc,_,_=trace(tr,gsN,cam,pdir); n0=orient(torch.nn.functional.normalize(2*nc-1,dim=-1),-pdir)
+    ldw,li,mask=load_view_lights(v,R)
+    return dict(cam=cam,pdir=pdir,hit=hit,p0=p0,n0=n0,ldw=ldw,li=li,mask=(hit&mask))
+
+
+def stage_a(S,tr,gsA0,gsN,K,cams,EPS):
+    G=view_gbuffer(tr,gsA0,gsN,K,cams,VIEW); hit=G["hit"]
+    print(f"  view {VIEW}: hit {int(hit.sum())} | mask {int(G['mask'].sum())}")
+    LIGHTS=[1,25,50]; to=lambda t:(t*hit[...,None]).detach().cpu().numpy()
+    fig,ax=plt.subplots(len(LIGHTS),3,figsize=(13,4.2*len(LIGHTS)))
+    for r,L in enumerate(LIGHTS):
+        l=G["ldw"][L-1]; ndl=torch.relu((G["n0"]*l.view(1,1,3)).sum(-1,keepdim=True)); vis=shadow_vis_dir(tr,gsA0,G["p0"],G["n0"],l,EPS)
+        model=(0.6/math.pi)*ndl*vis*hit[...,None].float(); real=load_img(VIEW,L,G["li"])*G["mask"][...,None].float()
+        s2=float((real[hit].mean()/(model[hit].mean()+1e-6)))
+        ax[r,0].imshow(srgb(np.clip(real.cpu().numpy(),0,None))); ax[r,0].set_title(f"REAL v{VIEW} L{L}")
+        ax[r,1].imshow(srgb(to(model*s2))); ax[r,1].set_title("RT render (grey alb + exact shadow)")
+        ax[r,2].imshow((vis[...,0]*hit.float()).detach().cpu().numpy(),cmap="gray"); ax[r,2].set_title("exact shadow vis")
+        for a in ax[r]: a.axis("off")
+    fig.suptitle(f"Phase 3 Stage A -- bear forward sanity (view {VIEW})",fontsize=12)
+    fig.tight_layout(); fig.savefig(os.path.join(OUT,f"stageA_view{VIEW:02d}.png"),dpi=110); plt.close(fig)
+    print(f"saved -> outputs/rt/dmv_bear/stageA_view{VIEW:02d}.png")
+
+
+def stage_b(S,tr,gsA0,gsN,K,cams,EPS,center,radius):
+    """recover bear albedo with EXACT-RT visibility vs SHADOW-MAP visibility (the material A/B on real data)."""
+    VIEWS_B=[1,8,15]; LIGHTS_B=list(range(1,81,3))                                    # 3 views x ~27 train lights
+    print(f"STAGE B | views {VIEWS_B} | {len(LIGHTS_B)} lights | precomputing visibility (exact + shadow-map)...")
+    pack=[]
+    with torch.no_grad():
+        for v in VIEWS_B:
+            G=view_gbuffer(tr,gsA0,gsN,K,cams,v); pl=[]
+            for L in LIGHTS_B:
+                l=G["ldw"][L-1]; ndl=torch.relu((G["n0"]*l.view(1,1,3)).sum(-1,keepdim=True))
+                vrt=shadow_vis_dir(tr,gsA0,G["p0"],G["n0"],l,EPS); vsm=vis_sm_dir(tr,gsA0,G["p0"],l,center,radius)
+                img=load_img(v,L,G["li"]); pl.append((ndl,vrt,vsm,img))
+            pack.append(dict(cam=G["cam"],pdir=G["pdir"],m=G["mask"][...,None].float(),pl=pl))
+            print(f"  view {v} packed ({len(LIGHTS_B)} lights)")
+
+    def optimize(mode,iters=200):
+        alb_raw=torch.nn.Parameter(torch.zeros(S["N"],3,device=DEV)); opt=torch.optim.Adam([alb_raw],lr=0.05)
+        for it in range(iters):
+            alb=torch.sigmoid(alb_raw); gsA=build_gs(S,alb); loss=0.0
+            for P in pack:
+                ap,_,_=trace(tr,gsA,P["cam"],P["pdir"])
+                for (ndl,vrt,vsm,img) in P["pl"]:
+                    vis=vrt if mode=="rt" else vsm
+                    loss=loss+((ap*ndl*vis-img)*P["m"]).abs().mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+            if it<2 or it%50==0: print(f"  [{mode}] it {it} loss {float(loss):.4f}")
+        with torch.no_grad():
+            alb=torch.sigmoid(alb_raw); rec,_,_=trace(tr,build_gs(S,alb),pack[0]["cam"],pack[0]["pdir"])
+        return rec.detach(), float(loss)
+    print("--- recover with EXACT RT visibility ---"); recRT,lossRT=optimize("rt")
+    print("--- recover with SHADOW-MAP visibility ---"); recSM,lossSM=optimize("sm")
+
+    G0=view_gbuffer(tr,gsA0,gsN,K,cams,VIEWS_B[0]); m=G0["mask"]; to=lambda t:(t*m[...,None]).detach().cpu().numpy()
+    # show a self-shadowing light's exact vs shadow-map visibility (where SM bakes error)
+    Ld=40; l=G0["ldw"][Ld-1]; vrt=shadow_vis_dir(tr,gsA0,G0["p0"],G0["n0"],l,EPS); vsm=vis_sm_dir(tr,gsA0,G0["p0"],l,center,radius)
+    fig,ax=plt.subplots(2,3,figsize=(14,9))
+    ax[0,0].imshow(srgb(to(recRT))); ax[0,0].set_title(f"recovered albedo: EXACT RT (fit {lossRT:.4f})")
+    ax[0,1].imshow(srgb(to(recSM))); ax[0,1].set_title(f"recovered albedo: SHADOW-MAP (fit {lossSM:.4f})")
+    ax[0,2].imshow(((recRT-recSM).abs().mean(-1)*m.float()).detach().cpu().numpy(),cmap="inferno",vmin=0,vmax=0.15); ax[0,2].set_title("|RT - shadow-map| albedo")
+    ax[1,0].imshow(srgb(np.clip((load_img(VIEWS_B[0],Ld,G0["li"])*m[...,None].float()).cpu().numpy(),0,None))); ax[1,0].set_title(f"a self-shadowing light L{Ld} (real)")
+    ax[1,1].imshow((vrt[...,0]*m.float()).cpu().numpy(),cmap="gray"); ax[1,1].set_title("exact RT shadow")
+    ax[1,2].imshow((vsm[...,0]*m.float()).cpu().numpy(),cmap="gray"); ax[1,2].set_title("shadow-map (acne/bias)")
+    for a in ax.ravel(): a.axis("off")
+    fig.suptitle("Phase 3 Stage B -- bear albedo recovery: exact RT visibility vs shadow-map (real data)",fontsize=12)
+    fig.tight_layout(); fig.savefig(os.path.join(OUT,"stageB_albedo_ab.png"),dpi=110); plt.close(fig)
+    print(f"STAGE B OK | data-fit RT {lossRT:.4f} vs SM {lossSM:.4f}")
+    print("saved -> outputs/rt/dmv_bear/stageB_albedo_ab.png")
+
+
+def main():
+    pts,nrm,scale=sample_mesh(os.path.join(ROOT,"mesh_Gt.ply"),N_GAUSS)
+    print(f"[bear] {pts.shape[0]} gaussians on mesh | spacing {scale:.2f} mm")
+    quat=quat_from_normal(nrm); sc=torch.tensor([scale,scale,scale*0.25],device=DEV).repeat(pts.shape[0],1)
+    dens=torch.full((pts.shape[0],1),0.99,device=DEV); N=pts.shape[0]
+    S=dict(pos=pts,quat=quat,sc=sc,dens=dens,N=N,nrm=nrm); EPS=scale*1.5
+    center=pts.mean(0); radius=float((pts-center).norm(dim=-1).max())
+    K,cams=calib()
+    gsA0=build_gs(S,torch.full((N,3),0.6,device=DEV)); gsN=build_gs(S,0.5*(nrm+1))
+    tr=tracer(); tr.build_acc(gsA0,rebuild=True)
+    if STAGE=="a": stage_a(S,tr,gsA0,gsN,K,cams,EPS)
+    elif STAGE=="b": stage_b(S,tr,gsA0,gsN,K,cams,EPS,center,radius)
+    else: print("unknown stage")
+
+
+if __name__=="__main__": main()
