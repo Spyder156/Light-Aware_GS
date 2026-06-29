@@ -16,7 +16,7 @@ import torch, numpy as np, cv2, scipy.io as sio
 from plyfile import PlyData
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 from rt_cornell import GS, tracer, quat_from_normal
-from giop import DEV, trace, orient, srgb
+from giop import DEV, trace, orient, srgb, ggx
 
 VIEW=int(sys.argv[1]) if len(sys.argv)>1 else 1
 STAGE=sys.argv[2] if len(sys.argv)>2 else "a"
@@ -311,6 +311,72 @@ def stage_d(S,tr,gsA0,gsN,K,cams,EPS,center,radius):
     print("saved -> outputs/rt/dmv_bear/stageD_wedge.png")
 
 
+def stage_e(S,tr,gsA0,gsN,K,cams,EPS):
+    """SPECULAR test on the bear: recover material with diffuse-only vs diffuse+GGX (global ks/roughness),
+    KNOWN calibrated lights (isolate the BRDF). Train on a light subset, relight held-out, compare PSNR.
+    Validates the GGX machinery + whether specular helps on a real (mostly-matte glazed) object."""
+    VIEWS_E=[1,8,15]; TRAIN=list(range(1,81,3)); HELD=[l for l in range(1,81) if l not in TRAIN][:10]
+    print(f"STAGE E (specular) | {SCENE} | views {VIEWS_E} | train {len(TRAIN)} | held {len(HELD)} | KNOWN lights")
+    def pack_for(lights):
+        pk=[]
+        with torch.no_grad():
+            for v in VIEWS_E:
+                G=view_gbuffer(tr,gsA0,gsN,K,cams,v); R,T=cams[v-1]; cc=-R.T@T
+                vdir=torch.nn.functional.normalize(cc.view(1,1,3)-G["p0"],dim=-1); pl=[]
+                for L in lights:
+                    l=G["ldw"][L-1]; ndl=torch.relu((G["n0"]*l.view(1,1,3)).sum(-1,keepdim=True))
+                    vis=shadow_vis_dir(tr,gsA0,G["p0"],G["n0"],l,EPS); pl.append((l,ndl,vis,load_img(v,L,G["li"])))
+                pk.append(dict(cam=G["cam"],pdir=G["pdir"],n0=G["n0"],vdir=vdir,m=G["mask"][...,None].float(),pl=pl))
+        return pk
+    train=pack_for(TRAIN); novel=pack_for(HELD)
+
+    def recover(spec,iters=200):
+        alb_raw=torch.nn.Parameter(torch.zeros(S["N"],3,device=DEV))
+        ks_raw=torch.nn.Parameter(torch.tensor(-2.0,device=DEV)); rg_raw=torch.nn.Parameter(torch.tensor(0.0,device=DEV))
+        ps=[alb_raw]+([ks_raw,rg_raw] if spec else [])
+        opt=torch.optim.Adam([{"params":[alb_raw],"lr":0.05},{"params":[ks_raw,rg_raw],"lr":0.02}]) if spec else torch.optim.Adam([alb_raw],lr=0.05)
+        for it in range(iters):
+            rho=torch.sigmoid(alb_raw); gsA=build_gs(S,rho); ks=torch.sigmoid(ks_raw); rg=0.05+0.9*torch.sigmoid(rg_raw); loss=0.0
+            for P in train:
+                ap,_,_=trace(tr,gsA,P["cam"],P["pdir"])
+                for (l,ndl,vis,img) in P["pl"]:
+                    model=ap*ndl*vis
+                    if spec: model=model+ggx(P["n0"],l.view(1,1,3),P["vdir"],ks,rg)*ndl*vis
+                    loss=loss+((model-img)*P["m"]).abs().mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+            if it%50==0: print(f"  [{'GGX' if spec else 'diff'}] it {it} loss {float(loss):.4f}")
+        return torch.sigmoid(alb_raw).detach(), float(torch.sigmoid(ks_raw)), float(0.05+0.9*torch.sigmoid(rg_raw))
+    def evalp(rho,ks,rg,spec):
+        gsA=build_gs(S,rho); ps=[]
+        with torch.no_grad():
+            for P in novel:
+                ap,_,_=trace(tr,gsA,P["cam"],P["pdir"])
+                for (l,ndl,vis,img) in P["pl"]:
+                    model=ap*ndl*vis
+                    if spec: model=model+ggx(P["n0"],l.view(1,1,3),P["vdir"],torch.tensor(ks,device=DEV),torch.tensor(rg,device=DEV))*ndl*vis
+                    ps.append(psnr(model,img,P["m"]))
+        return sum(ps)/len(ps)
+    print("--- diffuse-only ---"); rdf,_,_=recover(False); pdf=evalp(rdf,0,1,False)
+    print("--- diffuse + GGX ---"); rgg,ks,rg=recover(True); pgg=evalp(rgg,ks,rg,True)
+    print(f"STAGE E | held-out relight PSNR: diffuse {pdf:.2f} dB | diffuse+GGX {pgg:.2f} dB  ({pgg-pdf:+.2f}) | recovered ks {ks:.3f} rough {rg:.3f}")
+    # figure: TOP = recovered ALBEDO (de-lit) diffuse-baked vs GGX-stripped ; BOTTOM = held-out relight
+    P0=novel[0]; m=P0["m"]; gsD=build_gs(S,rdf); gsG=build_gs(S,rgg)
+    apD,_,_=trace(tr,gsD,P0["cam"],P0["pdir"]); apG,_,_=trace(tr,gsG,P0["cam"],P0["pdir"])
+    l,ndl,vis,img=P0["pl"][0]; specimg=ggx(P0["n0"],l.view(1,1,3),P0["vdir"],torch.tensor(ks,device=DEV),torch.tensor(rg,device=DEV))*ndl*vis
+    to=lambda t:(t*m).detach().cpu().numpy()
+    fig,ax=plt.subplots(2,3,figsize=(14,9))
+    ax[0,0].imshow(srgb(to(apD))); ax[0,0].set_title("recovered ALBEDO: diffuse-only (highlight baked in)")
+    ax[0,1].imshow(srgb(to(apG))); ax[0,1].set_title(f"recovered ALBEDO: +GGX (specular stripped, ks {ks:.3f})")
+    ax[0,2].imshow(((apD-apG).abs().mean(-1)*m[...,0]).detach().cpu().numpy(),cmap="inferno",vmin=0,vmax=0.1); ax[0,2].set_title("|diff| = where GGX stripped the specular")
+    ax[1,0].imshow(srgb(np.clip(to(img),0,None))); ax[1,0].set_title("REAL held-out light")
+    ax[1,1].imshow(srgb(to(apD*ndl*vis))); ax[1,1].set_title(f"relit: diffuse-only ({pdf:.1f} dB)")
+    ax[1,2].imshow(srgb(to(apG*ndl*vis+specimg))); ax[1,2].set_title(f"relit: diffuse+GGX ({pgg:.1f} dB)")
+    for a in ax.ravel(): a.axis("off")
+    fig.suptitle(f"Phase 4 specular ({SCENE}): de-lit albedo (specular stripped via joint inverse) + held-out relight",fontsize=12)
+    fig.tight_layout(); fig.savefig(os.path.join(OUT,"stageE_specular.png"),dpi=110); plt.close(fig)
+    print(f"saved -> outputs/rt/dmv_{TAG}/stageE_specular.png")
+
+
 def main():
     pts,nrm,scale=sample_mesh(os.path.join(ROOT,"mesh_Gt.ply"),N_GAUSS)
     print(f"[bear] {pts.shape[0]} gaussians on mesh | spacing {scale:.2f} mm")
@@ -325,6 +391,7 @@ def main():
     elif STAGE=="b": stage_b(S,tr,gsA0,gsN,K,cams,EPS,center,radius)
     elif STAGE=="c": stage_c(S,tr,gsA0,gsN,K,cams,EPS,center,radius)
     elif STAGE=="d": stage_d(S,tr,gsA0,gsN,K,cams,EPS,center,radius)
+    elif STAGE=="e": stage_e(S,tr,gsA0,gsN,K,cams,EPS)
     else: print("unknown stage")
 
 
