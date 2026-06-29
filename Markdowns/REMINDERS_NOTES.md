@@ -82,3 +82,30 @@ shadow** (visibility ∈ {0,1}).
 
 Decide when an object with strong concavities (e.g. `reading`) actually needs it. For now: recovered albedo
 looks good; keep the binary exact-shadow model and move on.
+
+### ★ IMPORTANT — unified soft-shadow transfer (the real fix; revisit as a phase)
+
+The deeper, *correct* fix (user's idea, and it's right): **stop computing shadow as a separate binary ray
+block. Treat light and dark with ONE smooth computation** — at each point, compute total incoming light over
+*all* directions; shadow = where that sum is small (and it's never zero, because indirect light still
+arrives). "The smooth, slow absence of light," not a wall.
+
+Methods (from the literature) that do exactly this:
+- **Precomputed Radiance Transfer (PRT)** — Sloan, Kautz, Snyder, SIGGRAPH 2002. Per-point **SH transfer**
+  function (self-shadow **+ interreflection fill**), precomputed once on **static geometry** (= our case);
+  relight = a smooth **dot product** `albedo · (transfer · light_SH)`. No shadow ray, soft + filled shadows,
+  differentiable in the light. **Subsumes the GI bounce** (interreflection is in the transfer).
+- **Spherical Gaussians (SG)** — e.g. **PhySG (Zhang et al., CVPR 2021)**: same unification, **sharper**
+  (all-frequency) shadows, fully differentiable. Use if low-order SH over-softens.
+- Physical split: soft shadow **edges** = finite light size (penumbra / area-light visibility integral);
+  filled shadow **core** = indirect bounce. PRT/SG capture both.
+
+**Key for us:** keep **albedo as a free multiplier OUTSIDE the transfer** (transfer = visibility⊗cos⊗
+interreflection, geometry-only). That's the one thing PRT-for-relighting (PRTGS) gets wrong — it bakes
+material — but we must keep albedo free (it's our unknown). Geometry is static, so this works.
+
+**Why important:** it fixes the black-shadow artifact (which is biting the relight PSNR), unifies light/dark,
+is differentiable (binary visibility has zero gradient at the edge — bad for the inverse), exploits our static
+geometry, and folds in the parked GI in one framework. Caveat: low-order SH → soft (may blur the crisp
+self-shadows we currently get exactly); more SH bands / SG = sharper. This is a real forward-model change →
+spec it as its own phase when we return.

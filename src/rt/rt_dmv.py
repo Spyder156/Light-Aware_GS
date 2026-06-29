@@ -178,6 +178,67 @@ def stage_b(S,tr,gsA0,gsN,K,cams,EPS,center,radius):
     print("saved -> outputs/rt/dmv_bear/stageB_albedo_ab.png")
 
 
+def precompute_pack(tr,gsA0,gsN,K,cams,EPS,center,radius,views,lights):
+    pack=[]
+    with torch.no_grad():
+        for v in views:
+            G=view_gbuffer(tr,gsA0,gsN,K,cams,v); pl=[]
+            for L in lights:
+                l=G["ldw"][L-1]; ndl=torch.relu((G["n0"]*l.view(1,1,3)).sum(-1,keepdim=True))
+                vrt=shadow_vis_dir(tr,gsA0,G["p0"],G["n0"],l,EPS); vsm=vis_sm_dir(tr,gsA0,G["p0"],l,center,radius)
+                pl.append((ndl,vrt,vsm,load_img(v,L,G["li"])))
+            pack.append(dict(v=v,cam=G["cam"],pdir=G["pdir"],li=G["li"],m=G["mask"][...,None].float(),pl=pl))
+    return pack
+
+def recover(tr,S,pack,mode,iters=200):
+    alb_raw=torch.nn.Parameter(torch.zeros(S["N"],3,device=DEV)); opt=torch.optim.Adam([alb_raw],lr=0.05)
+    for it in range(iters):
+        alb=torch.sigmoid(alb_raw); gsA=build_gs(S,alb); loss=0.0
+        for P in pack:
+            ap,_,_=trace(tr,gsA,P["cam"],P["pdir"])
+            for (ndl,vrt,vsm,img) in P["pl"]:
+                vis=vrt if mode=="rt" else vsm
+                loss=loss+((ap*ndl*vis-img)*P["m"]).abs().mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+        if it%50==0: print(f"  [{mode}] it {it} loss {float(loss):.4f}")
+    return torch.sigmoid(alb_raw).detach()
+
+def eval_psnr(tr,S,alb,pack,mode):
+    gsA=build_gs(S,alb); ps=[]
+    with torch.no_grad():
+        for P in pack:
+            ap,_,_=trace(tr,gsA,P["cam"],P["pdir"])
+            for (ndl,vrt,vsm,img) in P["pl"]:
+                vis=vrt if mode=="rt" else vsm; m=P["m"]
+                mse=float(((ap*ndl*vis-img)**2*m).sum()/(m.sum()*3+1e-8)); ps.append(-10*math.log10(mse+1e-10))
+    return sum(ps)/len(ps)
+
+def stage_c(S,tr,gsA0,gsN,K,cams,EPS,center,radius):
+    """relight HELD-OUT lights: exact-RT pipeline (RT-recovered albedo + RT shadows) vs shadow-map pipeline. PSNR vs real."""
+    VIEWS_C=[1,8,15]; TRAIN=list(range(1,81,3)); NOVEL=[l for l in range(1,81) if l not in TRAIN][:12]
+    print(f"STAGE C | views {VIEWS_C} | train {len(TRAIN)} lights | held-out {len(NOVEL)} lights")
+    train=precompute_pack(tr,gsA0,gsN,K,cams,EPS,center,radius,VIEWS_C,TRAIN)
+    novel=precompute_pack(tr,gsA0,gsN,K,cams,EPS,center,radius,VIEWS_C,NOVEL)
+    print("--- recover (exact RT) ---"); albRT=recover(tr,S,train,"rt")
+    print("--- recover (shadow-map) ---"); albSM=recover(tr,S,train,"sm")
+    pRT=eval_psnr(tr,S,albRT,novel,"rt"); pSM=eval_psnr(tr,S,albSM,novel,"sm")
+    print(f"HELD-OUT RELIGHT PSNR | exact-RT {pRT:.2f} dB | shadow-map {pSM:.2f} dB | gain {pRT-pSM:+.2f} dB")
+    # figure: 2 held-out lights, real | RT relit | SM relit
+    P0=novel[0]; m=P0["m"][...,0]; gsRT=build_gs(S,albRT); gsSM=build_gs(S,albSM)
+    apRT,_,_=trace(tr,gsRT,P0["cam"],P0["pdir"]); apSM,_,_=trace(tr,gsSM,P0["cam"],P0["pdir"])
+    to=lambda t:(t*P0["m"]).detach().cpu().numpy()
+    fig,ax=plt.subplots(2,3,figsize=(14,9))
+    for r,li in enumerate([0,5]):
+        ndl,vrt,vsm,img=P0["pl"][li]
+        ax[r,0].imshow(srgb(np.clip(to(img),0,None))); ax[r,0].set_title(f"REAL held-out light")
+        ax[r,1].imshow(srgb(to(apRT*ndl*vrt))); ax[r,1].set_title("relit: exact-RT pipeline")
+        ax[r,2].imshow(srgb(to(apSM*ndl*vsm))); ax[r,2].set_title("relit: shadow-map pipeline")
+        for a in ax[r]: a.axis("off")
+    fig.suptitle(f"Phase 3 Stage C -- bear relight on HELD-OUT lights: exact-RT {pRT:.2f} dB vs shadow-map {pSM:.2f} dB",fontsize=12)
+    fig.tight_layout(); fig.savefig(os.path.join(OUT,"stageC_relight.png"),dpi=110); plt.close(fig)
+    print("saved -> outputs/rt/dmv_bear/stageC_relight.png")
+
+
 def main():
     pts,nrm,scale=sample_mesh(os.path.join(ROOT,"mesh_Gt.ply"),N_GAUSS)
     print(f"[bear] {pts.shape[0]} gaussians on mesh | spacing {scale:.2f} mm")
@@ -190,6 +251,7 @@ def main():
     tr=tracer(); tr.build_acc(gsA0,rebuild=True)
     if STAGE=="a": stage_a(S,tr,gsA0,gsN,K,cams,EPS)
     elif STAGE=="b": stage_b(S,tr,gsA0,gsN,K,cams,EPS,center,radius)
+    elif STAGE=="c": stage_c(S,tr,gsA0,gsN,K,cams,EPS,center,radius)
     else: print("unknown stage")
 
 
