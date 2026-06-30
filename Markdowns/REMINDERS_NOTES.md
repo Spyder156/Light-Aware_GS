@@ -29,7 +29,7 @@ what's still off, and the levers to try when we come back.
 
 ## GI form-factor operator (Step 2) — parked 2026-06
 
-**What it is** (`src/rt/rt_step2.py`): a precomputed **per-pixel form-factor diffuse bounce** on coarse
+**What it is** (`src/stage1_synthetic_study/step2_gi_bounce.py`): a precomputed **per-pixel form-factor diffuse bounce** on coarse
 oriented surface patches (geometry is static → operator computed once, reused every optimization step).
 Ingredients: near-field-stable **area form factor** `cos·cos·A/(πr²+A)` + near-field r-clamp (kills edge
 waves); **closure normalization** (recovers ~18% discretization energy loss, capped for the open box front);

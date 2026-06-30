@@ -11,4 +11,4 @@ conda deactivate; conda activate "$ENV"
 conda install -y cmake ninja -c conda-forge
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 pip install slangtorch==1.3.18 "numpy<2" omegaconf imageio matplotlib
-echo "Done. Verify with: conda activate $ENV && python src/rt/rt_probe.py"
+echo "Done. Verify with: conda activate $ENV && python src/exploration/probe_tracer.py"
