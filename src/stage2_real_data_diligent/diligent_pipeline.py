@@ -9,14 +9,15 @@ diffuse reflectance model = albedo * max(n.l,0) * visibility (intensity divided 
 
 Stage A (this run): forward sanity -- render bear (grey albedo, exact shadows) under a few lights/view and
 compare to the real photos (shading + cast/self-shadows should line up). Run in `fullcircle`.
-Usage: rt_dmv.py [view] [stage]"""
+Usage: diligent_pipeline.py [view] [stage]"""
 import sys, os, math
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch, numpy as np, cv2, scipy.io as sio
 from plyfile import PlyData
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-from rt_cornell import GS, tracer, quat_from_normal
-from giop import DEV, trace, orient, srgb, ggx
+from rt_scene import GS, tracer, quat_from_normal
+from gi_operator import DEV, trace, orient, srgb, ggx
 
 VIEW=int(sys.argv[1]) if len(sys.argv)>1 else 1
 STAGE=sys.argv[2] if len(sys.argv)>2 else "a"
