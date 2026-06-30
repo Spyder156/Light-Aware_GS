@@ -5,15 +5,16 @@ Recover per-Gaussian albedo + light intensity, then diagnose:
   - per-channel best-fit scale s_c (recovered = s_c * true albedo)
   - raw albedo error vs SCALE-ALIGNED error (aligned << raw => shape right, scale wrong)
   - recovered light intensity vs true ; grey-sphere neutral probe for chromatic drift
-No scale anchor (would hide the drift). Uses shared helpers in giop. This is the GI-OFF baseline, so it's
+No scale anchor (would hide the drift). Uses shared helpers in gi_operator. This is the GI-OFF baseline, so it's
 config-independent; output still goes to outputs/rt/<CONFIG>/ for a uniform layout. fullcircle env.
-Usage: rt_step1.py [H] [iters] [gt_spp]"""
+Usage: step1_scale_drift.py [H] [iters] [gt_spp]"""
 import sys, os, math
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch, numpy as np
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-from rt_cornell import tracer, quat_from_normal, plane, sphere
-from giop import DEV, PI, EPS, DMIN, CONFIG, out_dir, feat_gs, orient, srgb, trace, surf, cosine_sample, shadow_vis
+from rt_scene import tracer, quat_from_normal, plane, sphere
+from gi_operator import DEV, PI, EPS, DMIN, CONFIG, out_dir, feat_gs, orient, srgb, trace, surf, cosine_sample, shadow_vis
 
 H=int(sys.argv[1]) if len(sys.argv)>1 else 128
 ITERS=int(sys.argv[2]) if len(sys.argv)>2 else 400

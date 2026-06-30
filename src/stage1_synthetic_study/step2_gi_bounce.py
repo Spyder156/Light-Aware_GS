@@ -1,15 +1,16 @@
 """STEP 2: the precomputed form-factor diffuse bounce, on a DIFFUSE Cornell box (grey sphere), single light
-(position known, intensity FREE). Uses the SHARED operator in giop.py (tune it there). Modes:
+(position known, intensity FREE). Uses the SHARED operator in gi_operator.py (tune it there). Modes:
   compare : ours indirect vs path-traced TRUE indirect + full model vs GT photo (single view operator check)
   measure : floor-vs-wall RGB numbers (ours vs TRUE) + chromaticity figure
   full    : the A/B inverse -- recover albedo + light with the bounce OFF vs ON; does indirect kill the drift
-Output -> outputs/rt/<CONFIG>/.  fullcircle env.  Usage: rt_step2.py [compare|measure|full] [H] [iters] [gt_spp]"""
+Output -> outputs/rt/<CONFIG>/.  fullcircle env.  Usage: step2_gi_bounce.py [compare|measure|full] [H] [iters] [gt_spp]"""
 import sys, os, math
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch, numpy as np
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-from rt_cornell import tracer, quat_from_normal, plane, sphere
-from giop import (DEV, PI, EPS, DMIN, BOUNCES, CONFIG, out_dir, feat_gs, orient, srgb, trace, trace_flat,
+from rt_scene import tracer, quat_from_normal, plane, sphere
+from gi_operator import (DEV, PI, EPS, DMIN, BOUNCES, CONFIG, out_dir, feat_gs, orient, srgb, trace, trace_flat,
                   surf, cosine_sample, shadow_vis, build_elements, build_K, exact_vis_G, radiosity, scatter_mean)
 
 MODE=sys.argv[1] if len(sys.argv)>1 else "compare"

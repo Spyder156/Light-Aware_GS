@@ -2,15 +2,16 @@
 Single light (position known, intensity FREE = the gauge partner). GT = GGX specular + diffuse multi-bounce
 GI + exact shadows. Each cell recovers per-Gaussian diffuse albedo + light intensity; the specular term (when
 ON) uses the KNOWN ks/roughness, so the cell isolates whether MODELING the highlight pins the light. GI ON
-adds the shared form-factor diffuse bounce (giop). Readout = recovered light vs true 7 + albedo error ->
+adds the shared form-factor diffuse bounce (gi_operator). Readout = recovered light vs true 7 + albedo error ->
 'is GI necessary, or does specular alone break the scale ambiguity?'. Output -> outputs/rt/<CONFIG>/. fullcircle env.
-Usage: rt_step3.py [H] [iters] [gt_spp]"""
+Usage: step3_ablation_2x2.py [H] [iters] [gt_spp]"""
 import sys, os, math
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch, numpy as np
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-from rt_cornell import tracer, quat_from_normal, plane, sphere
-from giop import (DEV, PI, EPS, DMIN, BOUNCES, CONFIG, out_dir, feat_gs, orient, srgb, trace, trace_flat,
+from rt_scene import tracer, quat_from_normal, plane, sphere
+from gi_operator import (DEV, PI, EPS, DMIN, BOUNCES, CONFIG, out_dir, feat_gs, orient, srgb, trace, trace_flat,
                   surf, cosine_sample, shadow_vis, ggx, build_elements, build_K, exact_vis_G, radiosity, scatter_mean)
 
 H=int(sys.argv[1]) if len(sys.argv)>1 else 160
