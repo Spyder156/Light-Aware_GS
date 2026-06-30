@@ -1,5 +1,27 @@
 # Reminders / Parked Research Notes
 
+## ★ Specular not fully stripped from recovered albedo (Phase 4, cow) — parked
+
+On the metal cow, even the GGX joint inverse leaves **light/dark in the recovered albedo that is actually
+specular/shading, not material** (user: "100% sure that's light, not the cow"). Causes: (a) a *global* GGX
+(one ks/roughness) can't fit a metal's spatially-varying highlights, so residual specular leaks into albedo
+via the symmetric L1 (which fits the average); (b) protruding/convex areas are consistently over-lit
+(specular + indirect) so any central estimator bakes the shine in.
+
+Tried: **lower-envelope recovery** (asymmetric loss, under-predict weighted 0.35) + **low-percentile (≈min-lit)
+data reference** instead of median. The principle is right (diffuse albedo lives at the *lower envelope* since
+specular/indirect only ADD), and the low-percentile reference is clearly better than median — **kept**. But
+the asymmetric loss at 0.35 **over-corrected**: it pulled the *whole* model down (not just the un-modelable
+highlights), so albedo went too dark and **held-out relight regressed ~3.5 dB** (cow GGX 38.5→35.0). Reverted
+the recovery loss to symmetric L1 for now.
+
+To revisit: per-Gaussian (not global) ks/roughness for spatially-varying specular; a *balanced* robust/
+lower-envelope loss (milder asymmetry ~0.6, or trimmed); possibly colored/Fresnel-correct specular for metal.
+Goal: strip the residual specular out of albedo without under-darkening. Tied to the shadow work below
+(unified transfer would help separate the diffuse base).
+
+
+
 Things deliberately parked at "good enough" to revisit later. Each entry: what it is, current quality,
 what's still off, and the levers to try when we come back.
 

@@ -342,7 +342,7 @@ def stage_e(S,tr,gsA0,gsN,K,cams,EPS):
                 for (l,ndl,vis,img) in P["pl"]:
                     model=ap*ndl*vis
                     if spec: model=model+ggx(P["n0"],l.view(1,1,3),P["vdir"],ks,rg)*ndl*vis
-                    loss=loss+((model-img)*P["m"]).abs().mean()
+                    loss=loss+((model-img)*P["m"]).abs().mean()                      # symmetric L1 (base); lower-envelope/min-lit albedo refinement parked (see REMINDERS_NOTES)
             opt.zero_grad(); loss.backward(); opt.step()
             if it%50==0: print(f"  [{'GGX' if spec else 'diff'}] it {it} loss {float(loss):.4f}")
         return torch.sigmoid(alb_raw).detach(), float(torch.sigmoid(ks_raw)), float(0.05+0.9*torch.sigmoid(rg_raw))
@@ -359,20 +359,27 @@ def stage_e(S,tr,gsA0,gsN,K,cams,EPS):
     print("--- diffuse-only ---"); rdf,_,_=recover(False); pdf=evalp(rdf,0,1,False)
     print("--- diffuse + GGX ---"); rgg,ks,rg=recover(True); pgg=evalp(rgg,ks,rg,True)
     print(f"STAGE E | held-out relight PSNR: diffuse {pdf:.2f} dB | diffuse+GGX {pgg:.2f} dB  ({pgg-pdf:+.2f}) | recovered ks {ks:.3f} rough {rg:.3f}")
-    # figure: TOP = recovered ALBEDO (de-lit) diffuse-baked vs GGX-stripped ; BOTTOM = held-out relight
-    P0=novel[0]; m=P0["m"]; gsD=build_gs(S,rdf); gsG=build_gs(S,rgg)
-    apD,_,_=trace(tr,gsD,P0["cam"],P0["pdir"]); apG,_,_=trace(tr,gsG,P0["cam"],P0["pdir"])
-    l,ndl,vis,img=P0["pl"][0]; specimg=ggx(P0["n0"],l.view(1,1,3),P0["vdir"],torch.tensor(ks,device=DEV),torch.tensor(rg,device=DEV))*ndl*vis
+    # data-driven REFERENCE albedo (no model): per-pixel median over lit lights of img/(n.l * vis)
+    Pv=train[0]; m=Pv["m"]; gsG=build_gs(S,rgg); gsD=build_gs(S,rdf)
+    apG,_,_=trace(tr,gsG,Pv["cam"],Pv["pdir"])                                        # our recovered (GGX) albedo, this view
+    accs=[]
+    for (l,ndl,vis,img) in Pv["pl"]:
+        a=img/(ndl*vis+1e-3); valid=((ndl>0.2)&(vis>0.5))
+        accs.append(torch.where(valid,a,torch.full_like(a,float("nan"))))
+    refalb=torch.nan_to_num(torch.nanquantile(torch.stack(accs,0),0.2,dim=0),nan=0.0).clamp(0,1)   # low-percentile = robust "min-lit" (strips specular/over-shine)
     to=lambda t:(t*m).detach().cpu().numpy()
+    P0=novel[0]; m0=P0["m"]; l,ndl,vis,img=P0["pl"][0]
+    apD0,_,_=trace(tr,gsD,P0["cam"],P0["pdir"]); apG0,_,_=trace(tr,gsG,P0["cam"],P0["pdir"])
+    specimg=ggx(P0["n0"],l.view(1,1,3),P0["vdir"],torch.tensor(ks,device=DEV),torch.tensor(rg,device=DEV))*ndl*vis
     fig,ax=plt.subplots(2,3,figsize=(14,9))
-    ax[0,0].imshow(srgb(to(apD))); ax[0,0].set_title("recovered ALBEDO: diffuse-only (highlight baked in)")
-    ax[0,1].imshow(srgb(to(apG))); ax[0,1].set_title(f"recovered ALBEDO: +GGX (specular stripped, ks {ks:.3f})")
-    ax[0,2].imshow(((apD-apG).abs().mean(-1)*m[...,0]).detach().cpu().numpy(),cmap="inferno",vmin=0,vmax=0.1); ax[0,2].set_title("|diff| = where GGX stripped the specular")
-    ax[1,0].imshow(srgb(np.clip(to(img),0,None))); ax[1,0].set_title("REAL held-out light")
-    ax[1,1].imshow(srgb(to(apD*ndl*vis))); ax[1,1].set_title(f"relit: diffuse-only ({pdf:.1f} dB)")
-    ax[1,2].imshow(srgb(to(apG*ndl*vis+specimg))); ax[1,2].set_title(f"relit: diffuse+GGX ({pgg:.1f} dB)")
+    ax[0,0].imshow(srgb(to(apG)));    ax[0,0].set_title(f"OUR recovered albedo (+GGX, lower-envelope loss, ks {ks:.3f})")
+    ax[0,1].imshow(srgb(to(refalb))); ax[0,1].set_title("DATA-REFERENCE albedo (low-percentile / min-lit, no model)")
+    ax[0,2].imshow(((apG-refalb).abs().mean(-1)*m[...,0]).detach().cpu().numpy(),cmap="inferno",vmin=0,vmax=0.15); ax[0,2].set_title("|ours - reference|")
+    ax[1,0].imshow(srgb(np.clip((img*m0).detach().cpu().numpy(),0,None))); ax[1,0].set_title("REAL held-out light")
+    ax[1,1].imshow(srgb((apD0*ndl*vis*m0).detach().cpu().numpy())); ax[1,1].set_title(f"relit: diffuse-only ({pdf:.1f} dB)")
+    ax[1,2].imshow(srgb(((apG0*ndl*vis+specimg)*m0).detach().cpu().numpy())); ax[1,2].set_title(f"relit: diffuse+GGX ({pgg:.1f} dB)")
     for a in ax.ravel(): a.axis("off")
-    fig.suptitle(f"Phase 4 specular ({SCENE}): de-lit albedo (specular stripped via joint inverse) + held-out relight",fontsize=12)
+    fig.suptitle(f"Phase 4 specular ({SCENE}): recovered albedo vs DATA-REFERENCE (is the light/dark real material?) + relight",fontsize=12)
     fig.tight_layout(); fig.savefig(os.path.join(OUT,"stageE_specular.png"),dpi=110); plt.close(fig)
     print(f"saved -> outputs/rt/dmv_{TAG}/stageE_specular.png")
 
