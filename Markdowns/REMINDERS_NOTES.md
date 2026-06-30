@@ -1,5 +1,35 @@
 # Reminders / Parked Research Notes
 
+## ★★ Shadows parked + the METRIC IS MISALIGNED WITH THE CLAIM (2026-07, the important one)
+
+**Parked:** the soft-shadow study (`stage3_shadow_transfer/shadow_recover.py`) is parked — results don't
+move. On isolated DiLiGenT objects under hard point lights, binary ≈ gifill > prt > sg (the soft transfers
+*oversoften* the genuinely-hard shadows, and there's no environment to provide fill). Come back later.
+
+**The real issue (user, and it's correct):** we are measuring the wrong thing.
+- The repo's CLAIM is **de-lighting / decomposition** (recover true light-free material, relight anything).
+- The metric we've been quoting is **same-view, held-out-*light* relight PSNR** — which **cannot detect a
+  de-lighting failure**. If the albedo has lighting baked in (e.g. convex areas left too bright), relighting
+  re-applies the *same* shading model and the baked error **cancels** → the photo is reproduced → high PSNR
+  with a wrong albedo. A baked 3DGS would pass the same test. We were grading ourselves on the one test our
+  method can't fail.
+- Symptom the user read off the figures: recovered albedo removes the sharp specular **shine** + a roughly
+  **uniform pale** (the global scale gauge / metamer), but the **spatially-varying** shading (convex/protruding
+  areas staying too bright) **remains baked in**. Cause: the forward model only explains **direct** light
+  (`albedo·n·l·vis`); the broad specular sheen + self-interreflection + ambient have nowhere to go but albedo.
+  And the global GGX collapsed to `ks≈0.02` (can't place localized glaze highlights → optimizer turns it off),
+  so specular is neither stripped nor relit — `|relit−real|` is *all* specular.
+
+**Metrics that actually test the claim (adopt these, retire same-view PSNR as headline):**
+- **Novel-*view* relight** (not novel-light-same-view): baked shading stops cancelling when the camera moves.
+- **Multi-view albedo consistency**: material is view-invariant; recover from view A vs B — disagreement = contamination.
+- **Albedo vs per-light lower envelope (floor)**: light only adds, so true albedo = floor across lights; recovered−floor on convex areas = baked light, quantified. (The "minimum not average" instinct, as a metric.)
+
+**Fundamental fixes to attack first (before more shadow work):**
+1. **Multi-view joint recovery** (currently single-view — prime breeding ground for baked-in shading; 20 views sharing one albedo would *force* convex over-brightness down). Likely the biggest lever.
+2. **Spatially-varying (per-Gaussian) specular** so the sheen is stripped AND relit.
+3. **Calibrated lower-envelope / floor prior** on albedo.
+
 ## ★ Specular not fully stripped from recovered albedo (Phase 4, cow) — parked
 
 On the metal cow, even the GGX joint inverse leaves **light/dark in the recovered albedo that is actually
