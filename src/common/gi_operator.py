@@ -1,14 +1,15 @@
 """Shared GI-operator + helpers for the RT light-transport experiments. The form-factor bounce lives HERE,
-in ONE place -- both rt_step2.py and rt_step3.py import it, so tuning the operator is a single edit.
+in ONE place -- both step2_gi_bounce.py and step3_ablation_2x2.py import it, so tuning the operator is a single edit.
 
 Operator config (VOX / BOUNCES / R_MAX) is defined here; CONFIG names the per-config output folder
 (outputs/rt/<CONFIG>/) so every step's figures for a given config land together and never overwrite
 across configs. Change the config -> change CONFIG -> outputs go to a new folder."""
 import sys, os, math
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "thirdparty"))
 import torch
 from threedgrut.datasets.protocols import Batch
-from rt_cornell import GS  # noqa: re-exported for convenience
+from rt_scene import GS  # noqa: re-exported for convenience
 
 DEV="cuda"; PI=math.pi; EPS=0.04; DMIN=0.6
 
