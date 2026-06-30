@@ -1,8 +1,9 @@
 import sys, math, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "thirdparty")); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch, numpy as np
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-from rt_gi import build_scene, surface, trace, tracer, DEV, OUT
+from cornell_gi import build_scene, surface, trace, tracer, DEV, OUT
 H = W = 320
 tr = tracer(); gsa, gsn = build_scene(); tr.build_acc(gsa, rebuild=True)
 f = 0.5*W/math.tan(0.5*math.radians(50))

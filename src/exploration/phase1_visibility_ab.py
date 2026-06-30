@@ -4,12 +4,13 @@
 Shows the RT backbone removes the shadow-map acne/aliasing/bias. Run in `fullcircle` env.
 Usage: rt_phase1.py [H] [spp]"""
 import sys, math, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "thirdparty"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch, numpy as np
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 from threedgrut.datasets.protocols import Batch
-from rt_cornell import GS, tracer, quat_from_normal, plane, sphere
+from rt_scene import GS, tracer, quat_from_normal, plane, sphere
 
 DEV = "cuda"; PI = math.pi
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "outputs", "rt")

@@ -3,11 +3,12 @@ view-facing density gradient, NOT the surface normal -> we get the true surface 
 second render pass where each Gaussian's color = encoded normal 0.5(n+1) (we constructed the scene,
 so we know the normals). Lambert, area light, firefly-clamped, spp. Usage: rt_gi.py [H] [spp] [NB]"""
 import sys, math, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "common"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "thirdparty"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch, numpy as np, imageio
 from threedgrut.datasets.protocols import Batch
-from rt_cornell import GS, tracer, quat_from_normal, plane, sphere
+from rt_scene import GS, tracer, quat_from_normal, plane, sphere
 
 DEV = "cuda"; OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "outputs", "rt"); PI = math.pi
 H = int(sys.argv[1]) if len(sys.argv) > 1 else 256
