@@ -43,6 +43,18 @@ Every idea explored, tagged **✅ works · ⚠️ tested-failed/neutral · 🅿�
 - Retinex / SIRFS (smooth illumination vs piecewise-flat reflectance; Barron–Malik). 💡
 - Learned albedo priors (IntrinsicAnything / RGB↔X). 💡 — but we're prior-free, likely skip.
 
+## Shadow over-brightness in crevices (real DiLiGenT) — gifill ADOPTED (2026-07)
+Verified: recovered albedo is **over-bright in low-coverage crevices** (bear: ~0.12 vs body ~0.077, gap 0.043;
+the curve rises monotonically as light-coverage falls). Root: the crevice albedo is pinned by its few **grazing-lit**
+frames (`image / small n·l`), NOT the shadowed ones. **Fixes that FAILED** (none flattened the gap): grazing
+down-weight, floor cap (floor is over-bright too), constant additive fill (only DC-shift), occlusion additive
+fill (barely), shadow-lightening `vis'=s+(1-s)vis` (zero effect — `s` only touches shadowed frames, which don't
+pin the albedo). **What WORKED: gifill in the solver** — model the form-factor GI bounce (`image += g·albedo·(G@B)`).
+Physical `g=1` cuts the gap 0.043→**0.027 (−37%)**; finer operator / more bounces plateau (interreflection energy
+is fixed). A GI **gain** g>1 keeps flattening (g3→0.022, g6→0.018, g10→0.015) — works because the GI gives the
+correct *crevice-shaped, albedo-modulated* fill; but g>1 is an unphysical over-weight. **Adopted g=1** (physical);
+g=3 is a free scalar knob if we want more. Remaining ~0.027 is a narrow grazing-lit artifact, logged as a limitation.
+
 ## F. From NVIDIA / NeuMatEx
 - Energy conservation → see E (✅ +1.8). Uncertainty-anchoring → our floor-anchor (❓ see E). AO-ambient (⚠️ see E).
 - Decision: **don't out-do their neural material; own the unknown/variable-light side.**
