@@ -1,0 +1,9 @@
+[project]
+name = "light_aware"
+version = "0.1.0"
+description = "Light-Aware GS: recover albedo (live) + relight, inside LichtFeld."
+dependencies = ["numpy"]
+
+[tool.lichtfeld]
+auto_start = true
+hot_reload = true
