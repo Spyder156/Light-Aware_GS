@@ -26,3 +26,6 @@ GaussianObject/
 __pycache__/
 *.o
 *.so
+.venv/
+src/stage6_lichtfeld_integration/light_aware_plugin/.venv/
+imgui.ini
