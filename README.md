@@ -12,6 +12,35 @@ shadows**. The lighting can then be stripped out (de-lit) and the scene relit un
 arbitrary new illumination, even when the capture lighting is unknown and changes frame
 to frame.
 
+## Joint reconstruction — no geometry given, lights unknown and per-image
+
+![joint de-lighting on held-out views](assets/joint_delighting_bear.png)
+
+The stronger setting: **no 3D mesh, no normals, no calibrated lights.** The input is only
+**posed multi-light images + silhouette masks** (here 17 views × 24 light directions of the
+DiLiGenT-MV *bear*), each shot under a *different, unknown* light. From that alone we jointly
+recover, in one Gaussian-Splatting optimisation, the **geometry**, a **light-invariant
+albedo**, and **every image's light** — then relight.
+
+Two ideas make the joint problem well-posed:
+
+- **The light is *solved*, not learned.** Each step, given the current normals+albedo, the
+  per-image light is recovered in closed form (variable projection, specular-robust) — so it
+  can never drift to *absorb* shading into a free parameter.
+- **Geometry is pinned by an albedo-free normal.** A wrong normal can hide behind a
+  compensating albedo (their product still fits the photo). But *ratios* of brightness across
+  lights cancel albedo (`b_i/b_j = (n·l_i)/(n·l_j)`), so the multi-light data pins the normal
+  independent of albedo; we enforce the geometry's depth-normal to match it.
+
+The figure shows **held-out views** (never trained): recovered albedo (auto-exposed) · our
+normals · GT normals · normal-error · real · re-render.
+
+> held-out **normal error 7.0°** vs GT · novel-view relight **40.8 dB / 4.6°** · novel-light
+> **41 dB / 4.1°** · **no GT normals used in training** · result unchanged under *randomised*
+> per-view lighting (not exploiting the capture grid)
+
+Code: [`src/stage7_joint_geometry_albedo/`](src/stage7_joint_geometry_albedo/) (gsplat backbone, `vision` env).
+
 ## Problem
 
 A diffuse image is the product `albedo · light`, so the two cannot be separated from
