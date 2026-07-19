@@ -83,15 +83,25 @@ def visual_hull(K, cams, masks, center, n_pts, res=128):
 
 
 # ---------- G-buffer render ----------
-def render_gbuffer(gauss, K, R, T, albedo=None):
-    """rasterize albedo(RGB) + expected depth. Returns rgb (H,W,3), depth (H,W), alpha (H,W)."""
+def render_gbuffer(gauss, K, R, T, albedo=None, width=W, height=H):
+    """rasterize albedo(RGB) + expected depth. Returns rgb (h,w,3), depth (h,w), alpha (h,w)."""
     means, quats, scales, opac = gauss["means"], gauss["quats"], gauss["scales"], gauss["opac"]
     col = albedo if albedo is not None else gauss["albedo"]
     out, alpha, _ = gsplat.rasterization(means, torch.nn.functional.normalize(quats, dim=-1), scales,
-                                         opac, col, w2c(R, T)[None], K[None], W, H,
+                                         opac, col, w2c(R, T)[None], K[None], width, height,
                                          render_mode="RGB+ED")                # gsplat appends expected-depth as last channel
     rgb = out[0, ..., :3]; depth = out[0, ..., 3]
     return rgb, depth, alpha[0, ..., 0]
+
+
+def backproject(depth, K, R, T):
+    """camera depth map -> world-space surface points (h,w,3)."""
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]; cc = -R.T @ T
+    ys, xs = torch.meshgrid(torch.arange(H, device=DEV), torch.arange(W, device=DEV), indexing="ij")
+    xcam = torch.stack([(xs + 0.5 - cx) / fx, (ys + 0.5 - cy) / fy, torch.ones_like(xs)], -1) * depth[..., None]
+    return torch.einsum("ji,hwj->hwi", R, xcam) + cc                          # R^T xcam + cam-centre
+
+
 
 
 def _masked_blur(x, mask, ksize=11, sigma=3.0):
@@ -123,6 +133,23 @@ def normals_from_depth(depth, K, R, alpha, thr=0.5, smooth=0.0):        # raw by
     n_world = torch.einsum("ji,hwj->hwi", R, n_cam)                        # cam -> world (R^T)
     n_world = n_world * (alpha[..., None] > thr).float()
     return n_world, n_cam
+
+
+
+
+def solve_light(nrm, rho_lum, obs_lum, mask, iters=6):
+    """ROBUST per-image light s=I*l from  obs = rho*(n.s): reject specular (brightest ~3%) + IRLS residual
+    reweighting + drop attached-shadow (n.s<0). The naive LS is fragile to highlights (breaks whole views)."""
+    m = mask & (obs_lum > 0.01)
+    N = nrm[m]; rl = rho_lum[m]; b = obs_lum[m]
+    if N.shape[0] < 50: return torch.tensor([0., 0, 1.], device=DEV), 1.0
+    thr = torch.quantile(b, 0.97); keep = b < thr                              # drop specular highlights
+    N, rl, b = N[keep], rl[keep], b[keep]
+    A0 = N * rl[:, None]; w = torch.ones_like(b)
+    for _ in range(iters):
+        s = torch.linalg.lstsq(A0 * w[:, None], (b * w).unsqueeze(1)).solution.squeeze(1)
+        r = (A0 @ s - b).abs(); w = (N @ s > 0).float() / (1 + r / (r.mean() + 1e-6))  # lit-facing, downweight outliers
+    return torch.nn.functional.normalize(s, dim=0), float(s.norm().clamp(min=1e-3))
 
 
 def srgb(a): return np.clip(np.asarray(a), 0, 1) ** (1 / 2.2)
