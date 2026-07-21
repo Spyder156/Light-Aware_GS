@@ -15,7 +15,8 @@ NG = int(sys.argv[3]) if len(sys.argv) > 3 else 80000
 LAM = float(sys.argv[4]) if len(sys.argv) > 4 else 0.3
 ROOT, OUT = J.paths(SCENE)
 HELD_VIEWS = [3, 11, 19]; TRAIN_VIEWS = [v for v in range(1, 21) if v not in HELD_VIEWS]  # 17 train, 3 held
-ALL_L = list(range(1, J.NL + 1)); TRAIN_L = ALL_L[::4]; HELD_L = ALL_L[2::8]    # 24 lights train, disjoint held
+ALL_L = list(range(1, J.NL + 1)); TRAIN_L = ALL_L[::4]; HELD_L = ALL_L[2::8]
+if os.environ.get("NLIGHTS"): TRAIN_L = ALL_L[:int(os.environ["NLIGHTS"])]   # fixed-lighting control (e.g. 1)
 REFRESH = 300
 
 
