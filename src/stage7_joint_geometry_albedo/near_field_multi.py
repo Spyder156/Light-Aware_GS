@@ -112,8 +112,8 @@ def main():
     alb_r = J.render_gbuffer({**S, "albedo": rho}, Kc, b0["R"], b0["T"])[0]; alb_tt = J.render_gbuffer(g_gt, Kc, b0["R"], b0["T"])[0]
     fig, ax = plt.subplots(1, 4, figsize=(16, 4.4))
     ax[0].imshow(J.srgb(J.to_np(obs[VIEWS[0]]))); ax[0].set_title("OBSERVED (3 coloured lights)")
-    ax[1].imshow(exp(alb_r)); ax[1].set_title("RECOVERED albedo (neutral, de-lit)")
-    ax[2].imshow(exp(alb_tt)); ax[2].set_title("TRUE albedo")
+    ax[1].imshow(J.srgb(J.to_np(alb_r * mk))); ax[1].set_title("RECOVERED albedo (neutral, de-lit)")
+    ax[2].imshow(J.srgb(J.to_np(alb_tt * mk))); ax[2].set_title("TRUE albedo")
     ax[3].imshow(J.to_np((alb_r - alb_tt).abs().mean(-1) * mk[..., 0]), cmap="inferno", vmin=0, vmax=0.1); ax[3].set_title(f"albedo error (L1 {alb_err:.3f})")
     for a in ax[:3]: a.axis("off")
     ax[3].set_xticks([]); ax[3].set_yticks([]); fig.tight_layout(); fig.savefig(os.path.join(TESTDIR, "albedo.png"), dpi=110); plt.close(fig)

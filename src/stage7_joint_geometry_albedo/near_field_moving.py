@@ -106,8 +106,8 @@ def main():
     ld = torch.nn.functional.normalize((-b0["R"].T @ b0["T"]) - center, dim=0)
     relit = alb_r * torch.relu((b0["n"] * ld.view(1, 1, 3)).sum(-1, keepdim=True)) * 2.2
     fig, ax = plt.subplots(1, 4, figsize=(16, 4.4))
-    ax[0].imshow(exp(alb_r)); ax[0].set_title("RECOVERED albedo (de-lit)")
-    ax[1].imshow(exp(alb_t)); ax[1].set_title("TRUE albedo")
+    ax[0].imshow(J.srgb(J.to_np(alb_r * mk))); ax[0].set_title("RECOVERED albedo (de-lit, raw)")
+    ax[1].imshow(J.srgb(J.to_np(alb_t * mk))); ax[1].set_title("TRUE albedo")
     ax[2].imshow(J.srgb(J.to_np(relit * mk))); ax[2].set_title("recovered albedo RELIT (fresh light)")
     ax[3].imshow(J.to_np((alb_r - alb_t).abs().mean(-1) * mk[..., 0]), cmap="inferno", vmin=0, vmax=0.1); ax[3].set_title(f"albedo error (L1 {alb_err:.3f})")
     for a in ax[:3]: a.axis("off")
