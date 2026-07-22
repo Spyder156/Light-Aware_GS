@@ -27,7 +27,7 @@ def gbuf(g, Kk, R, T):
 
 
 def shade_multi(alb, n, p, mask, Lpos, Lcol, LI, ambient):
-    out = alb * ambient.view(1, 1, 3)
+    out = alb * ambient   # ambient is WHITE (scalar) -> anchors albedo colour
     for k in range(Lpos.shape[0]):
         lv = Lpos[k].view(1, 1, 3) - p; r = lv.norm(dim=-1, keepdim=True)
         ndl = torch.relu((n * (lv / (r + 1e-6))).sum(-1, keepdim=True))
@@ -58,13 +58,13 @@ def main():
 
     obs = {}
     for v in VIEWS:
-        b = VB[v]; im = shade_multi(J.render_gbuffer(g_gt, Kc, b["R"], b["T"])[0], b["n"], b["p"], b["m"], Lt, Lcol_t, torch.full((K,), I0, device=J.DEV), torch.full((3,), AMB, device=J.DEV))
+        b = VB[v]; im = shade_multi(J.render_gbuffer(g_gt, Kc, b["R"], b["T"])[0], b["n"], b["p"], b["m"], Lt, Lcol_t, torch.full((K,), I0, device=J.DEV), torch.tensor(AMB, device=J.DEV))
         obs[v] = im; savepng(os.path.join(INDIR, f"view_{v:02d}.png"), im)
     print(f"NEAR-FIELD MULTI {SCENE} | radius {radius:.0f}mm | {K} coloured fixed lights + ambient | {len(VIEWS)} views -> {INDIR}")
 
     # recover: albedo + ambient(RGB) + K light positions + K colours + K intensities
     alb_raw = torch.nn.Parameter(torch.zeros(S["means"].shape[0], 3, device=J.DEV))
-    amb_raw = torch.nn.Parameter(torch.full((3,), -2.0, device=J.DEV))
+    amb_raw = torch.nn.Parameter(torch.tensor(-2.0, device=J.DEV))  # scalar white ambient
     Lpos = torch.nn.Parameter(Lt + torch.randn(K, 3, device=J.DEV) * radius * 0.8)
     Lcol_raw = torch.nn.Parameter(torch.zeros(K, 3, device=J.DEV)); lI = torch.nn.Parameter(torch.full((K,), math.log(I0), device=J.DEV))
     opt = torch.optim.Adam([{"params": [alb_raw], "lr": 0.02}, {"params": [amb_raw], "lr": 0.02}, {"params": [Lpos], "lr": radius * 0.04},
@@ -88,9 +88,9 @@ def main():
     alb_err = float((rho - rho_gt).abs().mean())
     with open(os.path.join(TESTDIR, "metrics.txt"), "w") as fp:
         fp.write(f"near-field MULTI | {SCENE}\n{K} lights, {len(VIEWS)} views | radius {radius:.1f}mm\nalbedo L1 {alb_err:.4f}\n"
-                 f"ambient true {AMB} recovered {float(amb.mean()):.3f}\nmean light-position error {pos_err:.1f}mm ({100*pos_err/radius:.0f}% radius)\n"
+                 f"ambient true {AMB} recovered {float(amb):.3f}\nmean light-position error {pos_err:.1f}mm ({100*pos_err/radius:.0f}% radius)\n"
                  f"mean light-colour error (1-cos) {col_err:.3f}\n")
-    print(f"RESULT | albedo L1 {alb_err:.4f} | {K}-light pos err {pos_err:.0f}mm ({100*pos_err/radius:.0f}%) | colour err {col_err:.3f} | ambient {float(amb.mean()):.3f}")
+    print(f"RESULT | albedo L1 {alb_err:.4f} | {K}-light pos err {pos_err:.0f}mm ({100*pos_err/radius:.0f}%) | colour err {col_err:.3f} | ambient {float(amb):.3f}")
 
     # ---- lights.png ----
     Lr = J.to_np(Lpos.detach()); Ltn = J.to_np(Lt); P = J.to_np(S["means"][::80]); c = J.to_np(center); Lc = J.to_np(Lcol.clamp(0, 1))
@@ -113,7 +113,7 @@ def main():
     fig, ax = plt.subplots(1, 4, figsize=(16, 4.4))
     ax[0].imshow(J.srgb(J.to_np(obs[VIEWS[0]]))); ax[0].set_title("OBSERVED (3 coloured lights)")
     ax[1].imshow(J.srgb(J.to_np(alb_r * mk))); ax[1].set_title("RECOVERED albedo (neutral, de-lit)")
-    ax[2].imshow(J.srgb(J.to_np(alb_tt * mk))); ax[2].set_title("TRUE albedo")
+    ax[2].imshow(J.srgb(J.to_np(alb_tt * mk))); ax[2].set_title("REFERENCE albedo (made the scene)")
     ax[3].imshow(J.to_np((alb_r - alb_tt).abs().mean(-1) * mk[..., 0]), cmap="inferno", vmin=0, vmax=0.1); ax[3].set_title(f"albedo error (L1 {alb_err:.3f})")
     for a in ax[:3]: a.axis("off")
     ax[3].set_xticks([]); ax[3].set_yticks([]); fig.tight_layout(); fig.savefig(os.path.join(TESTDIR, "albedo.png"), dpi=110); plt.close(fig)
